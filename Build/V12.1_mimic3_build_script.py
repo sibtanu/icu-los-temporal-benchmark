@@ -353,100 +353,100 @@ def main():
     logger.info("Completed adding new static features.")
 
         # === Add diagnosis-based features ===
-    logger.info("Adding diagnosis features...")
+    # logger.info("Adding diagnosis features...")
 
-    diag = pd.read_csv(f"{DATA_DIR}/DIAGNOSES_ICD.csv", usecols=["HADM_ID", "ICD9_CODE"])
-    dmap = pd.read_csv(f"{DATA_DIR}/D_ICD_DIAGNOSES.csv.gz", usecols=["ICD9_CODE", "SHORT_TITLE"])
-    diag = diag.merge(dmap, on="ICD9_CODE", how="left")
+    # diag = pd.read_csv(f"{DATA_DIR}/DIAGNOSES_ICD.csv", usecols=["HADM_ID", "ICD9_CODE"])
+    # dmap = pd.read_csv(f"{DATA_DIR}/D_ICD_DIAGNOSES.csv.gz", usecols=["ICD9_CODE", "SHORT_TITLE"])
+    # diag = diag.merge(dmap, on="ICD9_CODE", how="left")
 
-    # --- Normalize diagnosis text ---
-    diag["SHORT_TITLE"] = diag["SHORT_TITLE"].astype(str).str.lower()
+    # # --- Normalize diagnosis text ---
+    # diag["SHORT_TITLE"] = diag["SHORT_TITLE"].astype(str).str.lower()
 
-    # --- Top 10 broad groups ---
-    top_groups = {
-        "sepsis": ["sepsis", "septic"],
-        "respiratory": ["pneumonia", "respiratory", "copd", "asthma"],
-        "cardiac": ["cardiac", "heart", "myocard", "infarct", "angina"],
-        "renal": ["renal", "kidney", "uremia"],
-        "neuro": ["stroke", "cerebral", "neuro", "seizure"],
-        "trauma": ["fracture", "injury", "trauma"],
-        "infection": ["infection"],
-        "liver": ["liver", "hepatic"],
-        "cancer": ["cancer", "malignan"],
-        "metabolic": ["diabetes", "obesity", "metabolic"]
-    }
+    # # --- Top 10 broad groups ---
+    # top_groups = {
+    #     "sepsis": ["sepsis", "septic"],
+    #     "respiratory": ["pneumonia", "respiratory", "copd", "asthma"],
+    #     "cardiac": ["cardiac", "heart", "myocard", "infarct", "angina"],
+    #     "renal": ["renal", "kidney", "uremia"],
+    #     "neuro": ["stroke", "cerebral", "neuro", "seizure"],
+    #     "trauma": ["fracture", "injury", "trauma"],
+    #     "infection": ["infection"],
+    #     "liver": ["liver", "hepatic"],
+    #     "cancer": ["cancer", "malignan"],
+    #     "metabolic": ["diabetes", "obesity", "metabolic"]
+    # }
 
-    diag_flags = []
-    for name, kws in top_groups.items():
-        m = diag["SHORT_TITLE"].str.contains("|".join(kws), case=False, na=False)
-        subset = diag.loc[m, ["HADM_ID"]].drop_duplicates().assign(**{f"dx_{name}": 1})
-        diag_flags.append(subset)
+    # diag_flags = []
+    # for name, kws in top_groups.items():
+    #     m = diag["SHORT_TITLE"].str.contains("|".join(kws), case=False, na=False)
+    #     subset = diag.loc[m, ["HADM_ID"]].drop_duplicates().assign(**{f"dx_{name}": 1})
+    #     diag_flags.append(subset)
 
-    diag_flags_df = static_cols[["HADM_ID"]].copy()
-    for df_flag in diag_flags:
-        diag_flags_df = diag_flags_df.merge(df_flag, on="HADM_ID", how="left")
+    # diag_flags_df = static_cols[["HADM_ID"]].copy()
+    # for df_flag in diag_flags:
+    #     diag_flags_df = diag_flags_df.merge(df_flag, on="HADM_ID", how="left")
 
-    diag_flags_df = diag_flags_df.fillna(0).astype(int)
+    # diag_flags_df = diag_flags_df.fillna(0).astype(int)
 
-    # --- Charlson Comorbidity Index (simplified count proxy) ---
-    cci = diag.groupby("HADM_ID")["ICD9_CODE"].nunique().reset_index(name="CHARLSON_INDEX")
-    diag_flags_df = diag_flags_df.merge(cci, on="HADM_ID", how="left")
+    # # --- Charlson Comorbidity Index (simplified count proxy) ---
+    # cci = diag.groupby("HADM_ID")["ICD9_CODE"].nunique().reset_index(name="CHARLSON_INDEX")
+    # diag_flags_df = diag_flags_df.merge(cci, on="HADM_ID", how="left")
 
-    # --- Merge into static_cols ---
-    static_cols = static_cols.merge(diag_flags_df, on="HADM_ID", how="left")
+    # # --- Merge into static_cols ---
+    # static_cols = static_cols.merge(diag_flags_df, on="HADM_ID", how="left")
 
-    logger.info("Completed adding diagnosis features.")
+    # logger.info("Completed adding diagnosis features.")
 
-    # === NEW: True comorbidity flags (Charlson-style, ICD-9 prefixes) ===
-    diag["ICD9_CODE"] = diag["ICD9_CODE"].astype(str).str.replace(r"\D", "", regex=True)
+    # # === NEW: True comorbidity flags (Charlson-style, ICD-9 prefixes) ===
+    # diag["ICD9_CODE"] = diag["ICD9_CODE"].astype(str).str.replace(r"\D", "", regex=True)
 
-    charlson_map = {
-        "mi":        [r"^410", r"^412"],
-        "chf":       [r"^428"],
-        "pvd":       [r"^4439", r"^441", r"^7854", r"^V434", r"^V433"],
-        "cerebro":   [r"^430", r"^431", r"^432", r"^433", r"^434", r"^435", r"^436", r"^437", r"^438"],
-        "dementia":  [r"^290"],
-        "copd":      [r"^490", r"^491", r"^492", r"^494", r"^496"],
-        "rheum":     [r"^710", r"^714", r"^725"],
-        "pud":       [r"^531", r"^532", r"^533", r"^534"],
-        "mild_liver":[r"^5712", r"^5714", r"^5715", r"^5716", r"^5718", r"^5719"],
-        "diab_wo":   [r"^2500", r"^2501", r"^2502", r"^2503", r"^2508", r"^2509"],
-        "diab_w":    [r"^2504", r"^2505", r"^2506", r"^2507"],
-        "paralysis": [r"^342", r"^343", r"^344"],
-        "renal":     [r"^582", r"^5830", r"^5831", r"^5832", r"^5834", r"^5836", r"^585", r"^586", r"^5880"],
-        "any_cancer":[r"^140", r"^141", r"^142", r"^143", r"^144", r"^145", r"^146", r"^147", r"^148", r"^149",
-                    r"^150", r"^151", r"^152", r"^153", r"^154", r"^155", r"^156", r"^157", r"^158", r"^159",
-                    r"^160", r"^161", r"^162", r"^163", r"^164", r"^165", r"^170", r"^171", r"^172", r"^174",
-                    r"^175", r"^176", r"^179", r"^180", r"^181", r"^182", r"^183", r"^184", r"^185", r"^186",
-                    r"^187", r"^188", r"^189", r"^190", r"^191", r"^192", r"^193", r"^194", r"^195", r"^196",
-                    r"^197", r"^198", r"^199"],
-        "modsev_liver":[r"^5722", r"^5723", r"^5724", r"^5728"],
-        "metastatic":[r"^196", r"^197", r"^198", r"^199"],
-        "aids":      [r"^042", r"^043", r"^044"],
-    }
+    # charlson_map = {
+    #     "mi":        [r"^410", r"^412"],
+    #     "chf":       [r"^428"],
+    #     "pvd":       [r"^4439", r"^441", r"^7854", r"^V434", r"^V433"],
+    #     "cerebro":   [r"^430", r"^431", r"^432", r"^433", r"^434", r"^435", r"^436", r"^437", r"^438"],
+    #     "dementia":  [r"^290"],
+    #     "copd":      [r"^490", r"^491", r"^492", r"^494", r"^496"],
+    #     "rheum":     [r"^710", r"^714", r"^725"],
+    #     "pud":       [r"^531", r"^532", r"^533", r"^534"],
+    #     "mild_liver":[r"^5712", r"^5714", r"^5715", r"^5716", r"^5718", r"^5719"],
+    #     "diab_wo":   [r"^2500", r"^2501", r"^2502", r"^2503", r"^2508", r"^2509"],
+    #     "diab_w":    [r"^2504", r"^2505", r"^2506", r"^2507"],
+    #     "paralysis": [r"^342", r"^343", r"^344"],
+    #     "renal":     [r"^582", r"^5830", r"^5831", r"^5832", r"^5834", r"^5836", r"^585", r"^586", r"^5880"],
+    #     "any_cancer":[r"^140", r"^141", r"^142", r"^143", r"^144", r"^145", r"^146", r"^147", r"^148", r"^149",
+    #                 r"^150", r"^151", r"^152", r"^153", r"^154", r"^155", r"^156", r"^157", r"^158", r"^159",
+    #                 r"^160", r"^161", r"^162", r"^163", r"^164", r"^165", r"^170", r"^171", r"^172", r"^174",
+    #                 r"^175", r"^176", r"^179", r"^180", r"^181", r"^182", r"^183", r"^184", r"^185", r"^186",
+    #                 r"^187", r"^188", r"^189", r"^190", r"^191", r"^192", r"^193", r"^194", r"^195", r"^196",
+    #                 r"^197", r"^198", r"^199"],
+    #     "modsev_liver":[r"^5722", r"^5723", r"^5724", r"^5728"],
+    #     "metastatic":[r"^196", r"^197", r"^198", r"^199"],
+    #     "aids":      [r"^042", r"^043", r"^044"],
+    # }
 
-    def icd_match(series, patterns):
-        pat = "|".join(patterns)
-        return series.str.match(pat, na=False)
+    # def icd_match(series, patterns):
+    #     pat = "|".join(patterns)
+    #     return series.str.match(pat, na=False)
 
-    # Per-HADM flags
-    cm_flags = []
-    for name, pats in charlson_map.items():
-        m = icd_match(diag["ICD9_CODE"], pats)
-        cm_flags.append(diag.loc[m, ["HADM_ID"]].drop_duplicates().assign(**{f"cm_{name}": 1}))
+    # # Per-HADM flags
+    # cm_flags = []
+    # for name, pats in charlson_map.items():
+    #     m = icd_match(diag["ICD9_CODE"], pats)
+    #     cm_flags.append(diag.loc[m, ["HADM_ID"]].drop_duplicates().assign(**{f"cm_{name}": 1}))
 
-    cm_df = static_cols[["HADM_ID"]].drop_duplicates().copy()
-    for f in cm_flags:
-        cm_df = cm_df.merge(f, on="HADM_ID", how="left")
-    cm_df = cm_df.fillna(0).astype(int)
+    # cm_df = static_cols[["HADM_ID"]].drop_duplicates().copy()
+    # for f in cm_flags:
+    #     cm_df = cm_df.merge(f, on="HADM_ID", how="left")
+    # cm_df = cm_df.fillna(0).astype(int)
 
-    # Optional: simple Charlson unweighted sum (presence-based)
-    cm_cols = [c for c in cm_df.columns if c.startswith("cm_")]
-    cm_df["charlson_simple_sum"] = cm_df[cm_cols].sum(axis=1).astype("int16")
+    # # Optional: simple Charlson unweighted sum (presence-based)
+    # cm_cols = [c for c in cm_df.columns if c.startswith("cm_")]
+    # cm_df["charlson_simple_sum"] = cm_df[cm_cols].sum(axis=1).astype("int16")
 
-    # Merge into static_cols in the same block where you merge diag_flags_df
-    static_cols = static_cols.merge(cm_df, on="HADM_ID", how="left")
-    logger.info("Added comorbidity flags (Charlson-style) and charlson_simple_sum.")
+    # # Merge into static_cols in the same block where you merge diag_flags_df
+    # static_cols = static_cols.merge(cm_df, on="HADM_ID", how="left")
+    # logger.info("Added comorbidity flags (Charlson-style) and charlson_simple_sum.")
 
 
 
