@@ -28,10 +28,16 @@ from sklearn.metrics import (
 
 from mamba_ssm.modules.mamba_simple import Mamba
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
 
-BASE = "/lustre/home/rahas2/mimic_projects/outputs"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
+BASE = os.path.join(_PROJECT_ROOT, "processed_data", "structured_LOS_dynamic")
 DATA_DIR = f"{BASE}/lstm_data_v12.1_seq"
-OUT_DIR = f"{BASE}/mimic3_pure_mamba_binary_auc_models_v1"
+OUT_DIR = os.path.join(_PROJECT_ROOT, "results_LOS_dynamic", "mimic3_pure_mamba_binary_auc_models_v1")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -127,16 +133,7 @@ class PureMambaBinaryModel(nn.Module):
             nn.LayerNorm(128),
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(4 * d_model + 128, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Dropout(0.2),
-            nn.Linear(256, 128),
-            nn.GELU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 2),
-        )
+        self.head = build_standard_head(4 * d_model + 128, n_classes=2)
 
     def forward(self, xd, xs):
         h = torch.cat([self.dyn(xd), self.stat(xs)], dim=1)
@@ -227,12 +224,12 @@ def run_epoch(model, loader, device, criterion, optimizer=None, grad_clip=1.0, a
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
+    parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--d_model", type=int, default=192)
     parser.add_argument("--layers", type=int, default=3)
@@ -291,7 +288,8 @@ def main():
         layers=args.layers,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
 
     best_val_f1 = -1.0
@@ -337,6 +335,7 @@ def main():
             continue
 
         info = tune_binary_threshold(va_true, va_probs[:, 1])
+        scheduler.step(info["f1"])
 
         print(
             f"Epoch {epoch:02d} | train {tr_loss:.4f} | val {va_loss:.4f} | "

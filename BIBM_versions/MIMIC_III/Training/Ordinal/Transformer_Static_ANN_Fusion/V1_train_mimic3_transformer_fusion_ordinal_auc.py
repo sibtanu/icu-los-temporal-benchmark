@@ -23,7 +23,7 @@ Ordinal targets:
     logit 1 = P(LOS > 7 days)
 
 Reads:
-    /lustre/home/rahas2/mimic_projects/outputs/lstm_data_v12.1_seq
+    DATA_DIR (computed relative to project root -- see CONFIG section below)
 
 Expected files:
     X_dyn_train.npy / valid / test
@@ -31,7 +31,7 @@ Expected files:
     y_3c_train.npy / valid / test
 
 Outputs:
-    /lustre/home/rahas2/mimic_projects/outputs/mimic3_transformer_fusion_ordinal_auc_models_v1
+    OUT_DIR (computed relative to project root -- see CONFIG section below)
 
 Run:
     python V1_train_mimic3_transformer_fusion_ordinal_auc.py --workers 0 --batch 128
@@ -63,9 +63,16 @@ from sklearn.metrics import (
 # CONFIG
 # ======================================================
 
-BASE = "/lustre/home/rahas2/mimic_projects/outputs"
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
+BASE = os.path.join(_PROJECT_ROOT, "processed_data", "structured_LOS_dynamic")
 DATA_DIR = f"{BASE}/lstm_data_v12.1_seq"
-OUT_DIR = f"{BASE}/mimic3_transformer_fusion_ordinal_auc_models_v1"
+OUT_DIR = os.path.join(_PROJECT_ROOT, "results_LOS_dynamic", "mimic3_transformer_fusion_ordinal_auc_models_v1")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -266,12 +273,7 @@ class LOSTransformerOrdinalV127(nn.Module):
             num_layers=num_layers,
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 2),
-        )
+        self.head = build_standard_head(d_model, n_classes=2)  # 2 ordinal logits
 
     def forward(self, x_dyn, x_static):
         _, T, _ = x_dyn.shape
@@ -338,9 +340,6 @@ def train_epoch(
 
         optimizer.step()
 
-        if scheduler is not None:
-            scheduler.step()
-
         bs = y.size(0)
         loss_sum += loss.item() * bs
         n += bs
@@ -387,17 +386,17 @@ def eval_epoch(model, loader, device, criterion):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
     parser.add_argument("--d_model", type=int, default=128)
     parser.add_argument("--nhead", type=int, default=4)
     parser.add_argument("--layers", type=int, default=2)
     parser.add_argument("--ff_dim", type=int, default=256)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
 
     args = parser.parse_args()
 
@@ -475,21 +474,8 @@ def main():
         max_timesteps=X_dyn_train.shape[1],
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4,
-    )
-
-    total_steps = args.epochs * max(len(train_loader), 1)
-    warmup_steps = max(1, int(0.05 * total_steps))
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step + 1) / float(warmup_steps)
-        return 1.0
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
 
     best_val_f1 = -1.0
     best_val_loss = float("inf")
@@ -525,6 +511,7 @@ def main():
 
         val_f1 = threshold_info["f1"]
         val_acc = threshold_info["acc"]
+        scheduler.step(val_f1)
 
         print(
             f"Epoch {epoch:02d} | "

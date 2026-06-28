@@ -78,14 +78,20 @@ except Exception as e:
         f"Original error: {repr(e)}"
     )
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
 
 # ======================================================
 # CONFIG
 # ======================================================
 
-BASE = "/lustre/home/rahas2/mimic_projects/outputs"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
+BASE = os.path.join(_PROJECT_ROOT, "processed_data", "structured_LOS_dynamic")
 DATA_DIR = f"{BASE}/lstm_data_v12.1_seq"
-OUT_DIR = f"{BASE}/mimic3_ome_fusion_binary_auc_models_v1"
+OUT_DIR = os.path.join(_PROJECT_ROOT, "results_LOS_dynamic", "mimic3_ome_fusion_binary_auc_models_v1")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 
@@ -497,17 +503,7 @@ class OMEFusionBinary(nn.Module):
             nn.Linear(branch_dim // 2, 1),
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(fusion_dim, 384),
-            nn.GELU(),
-            nn.LayerNorm(384),
-            nn.Dropout(dropout),
-            nn.Linear(384, 192),
-            nn.GELU(),
-            nn.LayerNorm(192),
-            nn.Dropout(dropout),
-            nn.Linear(192, 2),
-        )
+        self.head = build_standard_head(fusion_dim, n_classes=2)
 
     def forward(self, x_dyn, x_static):
         h_lstm = self.lstm_branch(x_dyn)
@@ -638,11 +634,11 @@ def eval_epoch(model, loader, device, criterion, amp: bool = False):
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
 
     parser.add_argument("--branch_dim", type=int, default=192)
     parser.add_argument("--lstm_hidden", type=int, default=192)
@@ -656,7 +652,7 @@ def main():
     parser.add_argument("--expand", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.15)
 
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
     parser.add_argument("--amp", action="store_true")
 
     args = parser.parse_args()
@@ -745,18 +741,8 @@ def main():
         f"nhead={args.nhead}, d_state={args.d_state}"
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4,
-    )
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3,
-    )
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
 
     scaler = torch.cuda.amp.GradScaler(
         enabled=(args.amp and device.type == "cuda")
