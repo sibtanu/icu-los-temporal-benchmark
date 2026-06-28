@@ -14,11 +14,19 @@ import os, re, json, argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from sklearn.model_selection import train_test_split
+
+from los_split_utils import ensure_subject_id, patient_level_split_indices
 
 # ---------------- CONFIG ----------------
-BASE_DIR   = "/lustre/home/rahas2/mimic_projects/outputs"
-DATA_DIR   = "/lustre/home/rahas2/mimic_projects/data"
+# Same original_data/processed_data locations as clean_LOS and
+# V12.1_build_script.py -- see that script's CONFIG section for why this
+# walks up 3 levels (this script's own directory is 3 levels below the
+# project root that clean_LOS sits directly under).
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+
+BASE_DIR   = os.path.join(_PROJECT_ROOT, "processed_data", "structured_LOS_dynamic")
+DATA_DIR   = os.path.join(_PROJECT_ROOT, "original_data")
 INPUT_CSV  = f"{BASE_DIR}/mimic_los_timewindows_wide_v12.1_imputed.csv"
 OUTPUT_DIR = f"{BASE_DIR}/lstm_data_v12.1_seq"
 ADMISSIONS_FILE = f"{DATA_DIR}/ADMISSIONS.csv"
@@ -42,7 +50,12 @@ def extract_hour_start(col: str) -> int:
     return int(m.group(1)) if m else -1
 
 def is_dynamic_col(col: str) -> bool:
-    return bool(HOUR_SUFFIX_RE.search(col))
+    # _0_24h aggregate-total columns match the same _<h>_<h+1>h-shaped regex
+    # but are NOT a per-hour timestep -- they're a single whole-window
+    # summary, handled as a static feature below (see derived_0_24). The
+    # impute script already excludes them from its own hourly handling for
+    # the same reason; this keeps the two scripts consistent.
+    return bool(HOUR_SUFFIX_RE.search(col)) and not col.endswith("_0_24h")
 
 def base_name(col: str) -> str:
     m = HOUR_SUFFIX_RE.search(col)
@@ -72,64 +85,9 @@ def assert_and_clean(arr: np.ndarray, name: str):
 def blank_series(df: pd.DataFrame):
     return pd.Series("", index=df.index)
 
-def ensure_subject_id(df: pd.DataFrame, admissions_path: str) -> pd.DataFrame:
-    if "SUBJECT_ID" in df.columns:
-        return df
-
-    if "HADM_ID" not in df.columns:
-        raise ValueError("Need HADM_ID to recover SUBJECT_ID.")
-
-    if not os.path.exists(admissions_path):
-        raise FileNotFoundError(
-            f"SUBJECT_ID missing and ADMISSIONS.csv not found: {admissions_path}"
-        )
-
-    print("[preproc V12.1] SUBJECT_ID missing; merging from ADMISSIONS.csv...")
-    adm = pd.read_csv(admissions_path, usecols=["HADM_ID", "SUBJECT_ID"])
-    adm = adm.drop_duplicates("HADM_ID")
-
-    df = df.merge(adm, on="HADM_ID", how="left")
-
-    if df["SUBJECT_ID"].isna().any():
-        n = int(df["SUBJECT_ID"].isna().sum())
-        raise ValueError(f"Failed to recover SUBJECT_ID for {n} rows.")
-
-    return df
-
-def patient_level_split_indices(df: pd.DataFrame, seed: int):
-    y = pd.to_numeric(df["LOS_label"], errors="coerce").fillna(-1).astype(int)
-    valid_mask = y != -1
-
-    work = df.loc[valid_mask, ["SUBJECT_ID"]].copy()
-    work["LOS_label"] = y.loc[valid_mask].values
-
-    subj_labels = (
-        work.groupby("SUBJECT_ID")["LOS_label"]
-        .max()
-        .reset_index()
-    )
-
-    train_subj, rest_subj = train_test_split(
-        subj_labels["SUBJECT_ID"],
-        test_size=0.30,
-        stratify=subj_labels["LOS_label"],
-        random_state=seed,
-    )
-
-    rest_labels = subj_labels[subj_labels["SUBJECT_ID"].isin(rest_subj)]
-
-    valid_subj, test_subj = train_test_split(
-        rest_labels["SUBJECT_ID"],
-        test_size=0.50,
-        stratify=rest_labels["LOS_label"],
-        random_state=seed,
-    )
-
-    train_idx = df.index[df["SUBJECT_ID"].isin(set(train_subj))].to_numpy()
-    valid_idx = df.index[df["SUBJECT_ID"].isin(set(valid_subj))].to_numpy()
-    test_idx  = df.index[df["SUBJECT_ID"].isin(set(test_subj))].to_numpy()
-
-    return train_idx, valid_idx, test_idx
+# ensure_subject_id / patient_level_split_indices now live in
+# los_split_utils.py (shared with V12.1_impute_script.py) so the two
+# scripts can never silently disagree on which SUBJECT_IDs are "train".
 
 # ---------------- MAIN ----------------
 def main():
@@ -178,7 +136,10 @@ def main():
         f"test={df.loc[test_idx, 'SUBJECT_ID'].nunique():,}"
     )
 
-    df["AGE"] = pd.to_numeric(df["AGE"], errors="coerce").clip(0, 120)
+    # 90, not 120: MIMIC-III shifts DOB so patients >89 appear ~300y old; the
+    # build script already recovers this as 90 -- keep this clip consistent
+    # with that instead of re-introducing the old 120 bound here.
+    df["AGE"] = pd.to_numeric(df["AGE"], errors="coerce").clip(0, 90)
 
     dyn_train_medians = df.loc[train_idx, dyn_cols].median(skipna=True).fillna(0.0)
     df[dyn_cols] = df[dyn_cols].replace([np.inf, -np.inf], np.nan)
@@ -220,17 +181,26 @@ def main():
         prefix="ETH"
     )
 
+    # XS: hospital service (SERVICES.CURR_SERVICE), added by V12.1_build_script.py
+    # but previously never one-hot-encoded here -- it was silently dropped
+    # from the static block.
+    Xs = one_hot(
+        df["XS"] if "XS" in df.columns else blank_series(df),
+        ["MED", "SURG", "CMED", "CSURG", "NSURG", "OMED", "ORTHO", "TSURG"],
+        prefix="XS"
+    )
+
     num_statics = []
     for c in ["ED_TO_ICU_HOURS", "PRIOR_ICU_COUNT_SUBJ"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
             num_statics.append(c)
 
-    derived_0_24 = [c for c in [
-        "fluid_input_sum_0_24h", "total_output_sum_0_24h", "urine_output_sum_0_24h",
-        "fluid_balance_sum_0_24h", "pressor_any_0_24h", "s_f_min_0_24h",
-        "antibiotic_any_0_24h", "sedative_any_0_24h", "insulin_any_0_24h", "diuretic_any_0_24h"
-    ] if c in df.columns]
+    # Auto-discover every *_0_24h aggregate-total column rather than a fixed
+    # hardcoded list, so any new one the build script adds later is picked
+    # up here automatically instead of silently falling through the same
+    # gap XS just fell through.
+    derived_0_24 = [c for c in df.columns if c.endswith("_0_24h")]
 
     if derived_0_24:
         mu_d = df.loc[train_idx, derived_0_24].mean().fillna(0.0)
@@ -249,7 +219,7 @@ def main():
     std = df.loc[train_idx, scale_cols].std().replace(0.0, 1.0).fillna(1.0)
     df[scale_cols] = zscore(df[scale_cols], mu, std).fillna(0.0)
 
-    static_pieces = [df["AGE"].astype(np.float32), Xg, Xa, Xcu, Xloc, Xins, Xeth]
+    static_pieces = [df["AGE"].astype(np.float32), Xg, Xa, Xcu, Xloc, Xins, Xeth, Xs]
 
     if num_statics:
         static_pieces.append(df[num_statics].astype(np.float32))

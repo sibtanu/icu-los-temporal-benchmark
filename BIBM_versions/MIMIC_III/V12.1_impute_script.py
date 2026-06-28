@@ -15,7 +15,9 @@ import logging
 import argparse
 import pandas as pd
 import numpy as np
-from sklearn.model_selection import train_test_split
+from sklearn.impute import KNNImputer
+
+from los_split_utils import ensure_subject_id, patient_level_split_indices
 
 # ---------------- Logging ----------------
 logger = logging.getLogger("v12.1_impute")
@@ -26,8 +28,15 @@ _sh.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(_sh)
 
 # ---------------- Config / CLI ----------------
-DEF_BASE = "/lustre/home/rahas2/mimic_projects/outputs"
-DEF_DATA = "/lustre/home/rahas2/mimic_projects/data"
+# Same original_data/processed_data locations as clean_LOS and
+# V12.1_build_script.py -- see that script's CONFIG section for why this
+# walks up 3 levels (this script's own directory is 3 levels below the
+# project root that clean_LOS sits directly under).
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+
+DEF_BASE = os.path.join(_PROJECT_ROOT, "processed_data", "structured_LOS_dynamic")
+DEF_DATA = os.path.join(_PROJECT_ROOT, "original_data")
 DEF_IN   = f"{DEF_BASE}/mimic_los_timewindows_wide_v12.1.csv"
 DEF_OUT  = f"{DEF_BASE}/mimic_los_timewindows_wide_v12.1_imputed.csv"
 DEF_ADM  = f"{DEF_DATA}/ADMISSIONS.csv"
@@ -44,6 +53,16 @@ def parse_args():
     ap.add_argument("--output", default=DEF_OUT)
     ap.add_argument("--admissions", default=DEF_ADM)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument(
+        "--imputer", choices=["knn", "mean"], default="knn",
+        help="How to fill whatever's left after LOCF: KNN (default, borrows "
+             "values from the most similar TRAIN admissions) or a plain "
+             "train-only column mean fallback.",
+    )
+    ap.add_argument(
+        "--n_neighbors", type=int, default=5,
+        help="K for KNNImputer (only used when --imputer=knn).",
+    )
     return ap.parse_args()
 
 def is_hourly_col(col: str) -> bool:
@@ -57,64 +76,9 @@ def hour_start(col: str) -> int:
     m = HOUR_SUFFIX_RE.search(col)
     return int(m.group(1)) if m else -1
 
-def ensure_subject_id(df: pd.DataFrame, admissions_path: str) -> pd.DataFrame:
-    if "SUBJECT_ID" in df.columns:
-        return df
-
-    if "HADM_ID" not in df.columns:
-        raise ValueError("Need HADM_ID to recover SUBJECT_ID.")
-
-    if not os.path.exists(admissions_path):
-        raise FileNotFoundError(
-            f"SUBJECT_ID missing and ADMISSIONS.csv not found: {admissions_path}"
-        )
-
-    logger.info("SUBJECT_ID missing; merging from ADMISSIONS.csv...")
-    adm = pd.read_csv(admissions_path, usecols=["HADM_ID", "SUBJECT_ID"])
-    adm = adm.drop_duplicates("HADM_ID")
-
-    df = df.merge(adm, on="HADM_ID", how="left")
-
-    if df["SUBJECT_ID"].isna().any():
-        n = int(df["SUBJECT_ID"].isna().sum())
-        raise ValueError(f"Failed to recover SUBJECT_ID for {n} rows.")
-
-    return df
-
-def patient_level_split_indices(df: pd.DataFrame, seed: int):
-    y = pd.to_numeric(df["LOS_label"], errors="coerce").fillna(-1).astype(int)
-    valid_mask = y != -1
-
-    work = df.loc[valid_mask, ["SUBJECT_ID"]].copy()
-    work["LOS_label"] = y.loc[valid_mask].values
-
-    subj_labels = (
-        work.groupby("SUBJECT_ID")["LOS_label"]
-        .max()
-        .reset_index()
-    )
-
-    train_subj, rest_subj = train_test_split(
-        subj_labels["SUBJECT_ID"],
-        test_size=0.30,
-        stratify=subj_labels["LOS_label"],
-        random_state=seed,
-    )
-
-    rest_labels = subj_labels[subj_labels["SUBJECT_ID"].isin(rest_subj)]
-
-    valid_subj, test_subj = train_test_split(
-        rest_labels["SUBJECT_ID"],
-        test_size=0.50,
-        stratify=rest_labels["LOS_label"],
-        random_state=seed,
-    )
-
-    train_idx = df.index[df["SUBJECT_ID"].isin(set(train_subj))].to_numpy()
-    valid_idx = df.index[df["SUBJECT_ID"].isin(set(valid_subj))].to_numpy()
-    test_idx  = df.index[df["SUBJECT_ID"].isin(set(test_subj))].to_numpy()
-
-    return train_idx, valid_idx, test_idx
+# ensure_subject_id / patient_level_split_indices now live in
+# los_split_utils.py (shared with V12.1_preprocess_script.py) so the two
+# scripts can never silently disagree on which SUBJECT_IDs are "train".
 
 # ---------------- Main ----------------
 def main():
@@ -172,15 +136,43 @@ def main():
             if vals.issubset({0.0, 1.0}):
                 binary_like.append(c)
 
-    logger.info("Filling remaining NaNs with TRAIN-ONLY column means...")
+    # Columns with zero observed values in TRAIN carry no information for
+    # either a mean or a KNN fill -- pin these to 0.0 up front (same
+    # behavior as before), then impute everything else.
     col_means = df.loc[train_idx, feature_cols].mean(axis=0, skipna=True)
-
     entirely_nan = col_means[col_means.isna()].index.tolist()
     if entirely_nan:
         logger.warning(f"{len(entirely_nan)} columns entirely NaN in train; filling with 0.0")
-        col_means.loc[entirely_nan] = 0.0
+        df[entirely_nan] = df[entirely_nan].fillna(0.0)
 
-    df[feature_cols] = df[feature_cols].fillna(col_means)
+    impute_cols = [c for c in feature_cols if c not in entirely_nan]
+
+    if args.imputer == "knn" and impute_cols:
+        logger.info(
+            f"Filling remaining NaNs with a TRAIN-only-fitted KNNImputer "
+            f"(n_neighbors={args.n_neighbors}) over {len(impute_cols)} columns..."
+        )
+        # KNN distance is scale-sensitive (HR ~60-150 would swamp SpO2
+        # ~90-100 or lactate ~0-10 otherwise), so z-score with TRAIN-only
+        # mean/std before imputing, then convert back to clinical units so
+        # the imputed CSV's contract (raw units) is unchanged for everything
+        # downstream. Fit once on train; transform() re-uses those same
+        # fitted train neighbors for valid/test, so nothing leaks.
+        train_mean = df.loc[train_idx, impute_cols].mean(axis=0, skipna=True)
+        train_std = df.loc[train_idx, impute_cols].std(axis=0, skipna=True).replace(0.0, 1.0).fillna(1.0)
+
+        knn = KNNImputer(n_neighbors=args.n_neighbors)
+        knn.fit(((df.loc[train_idx, impute_cols] - train_mean) / train_std).values)
+
+        for split_name, idx in (("train", train_idx), ("valid", valid_idx), ("test", test_idx)):
+            scaled = ((df.loc[idx, impute_cols] - train_mean) / train_std).values
+            imputed_scaled = knn.transform(scaled)
+            df.loc[idx, impute_cols] = imputed_scaled * train_std.values + train_mean.values
+            logger.info(f"  KNN-imputed {split_name}: {len(idx):,} rows")
+    elif impute_cols:
+        logger.info("Filling remaining NaNs with TRAIN-ONLY column means...")
+        col_means_remaining = df.loc[train_idx, impute_cols].mean(axis=0, skipna=True)
+        df[impute_cols] = df[impute_cols].fillna(col_means_remaining)
 
     if binary_like:
         df[binary_like] = (df[binary_like] > 0.5).astype(int)
@@ -188,7 +180,11 @@ def main():
     remaining = int(df[feature_cols].isna().sum().sum())
     if remaining:
         raise RuntimeError(f"Imputation failed: {remaining} NaNs remain.")
-    logger.info("Validation passed: no NaNs remain in hourly features.")
+    logger.info(
+        "Validation passed: no NaNs remain in per-hour feature columns "
+        "(this check intentionally excludes *_0_24h aggregate columns, "
+        "which the preprocess script imputes separately as static features)."
+    )
 
     feature_cols_ordered = []
     for base in sorted(groups.keys()):
