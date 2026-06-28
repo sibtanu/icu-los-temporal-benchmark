@@ -1,0 +1,41 @@
+# Dependencies for the BIBM MIMIC-III training scripts under
+# BIBM_versions/MIMIC_III/Training/ (Binary/, Ordinal/, Multiclass/) --
+# model_common.py, every V1_train_mimic3_*.py, combine_results.py.
+#
+# Needs a CUDA-enabled torch: 3 of 6 architectures (Hybrid BiLSTM+Mamba,
+# OME-Fusion, Pure-Mamba) import mamba_ssm, which requires CUDA and its own
+# build dependency (causal-conv1d). requirements-dataprep.txt (used for the
+# data-build/impute/preprocess scripts) is CPU-only and does not cover any
+# of this -- keep this as a separate env for the same reason
+# requirements-dataprep.txt and requirements-ml.txt are kept separate from
+# each other (different native-dependency stacks shouldn't resolve in the
+# same pip/conda solver call).
+#
+# Install with:  pip install -r requirements-train.txt
+# (On Wahab: crun -p ~/envs/<ENV_NAME> pip install -r requirements-train.txt)
+#
+# Install torch FIRST, matching Wahab's CUDA version (check with
+# `nvidia-smi` / `module avail cuda`), e.g.:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+#
+# Then mamba_ssm + its build dependencies:
+#   pip install packaging ninja
+#   pip install causal-conv1d>=1.4.0
+#   pip install mamba-ssm
+#
+# mamba-ssm ships prebuilt wheels for common torch+CUDA+Python combos on its
+# GitHub releases page (https://github.com/state-spaces/mamba/releases) --
+# if `pip install mamba-ssm` tries to build from source and fails (no nvcc/
+# CUDA toolkit on the node), download the wheel matching your exact
+# torch/CUDA/Python version from there instead and `pip install` that file
+# directly. Same applies to causal-conv1d
+# (https://github.com/Dao-AILab/causal-conv1d/releases).
+
+numpy
+pandas
+scikit-learn
+torch
+packaging
+ninja
+causal-conv1d>=1.4.0
+mamba-ssm
