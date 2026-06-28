@@ -40,8 +40,19 @@ CHUNK_SIZE = 500_000
 WINDOW_HOURS = list(range(0, 25))   # edges for hourly bins 0–24
 CONVERT_TEMPS_TO_C = True
 
-DATA_DIR = "/lustre/home/rahas2/mimic_projects/data"
-OUTPUT_DIR = "/lustre/home/rahas2/mimic_projects/outputs"
+# Same raw-data / processed-data locations as clean_LOS (and the other
+# clean_* pipelines): a shared "original_data" and "processed_data" at the
+# project root, one level above each pipeline's own folder. clean_LOS sits
+# directly under the project root ("../original_data" resolves there); this
+# script sits 3 levels deeper (sibtanu-time-series-research/BIBM_versions/
+# MIMIC_III/), so it walks up 3 levels instead of 1 to reach the same root --
+# keep this script at that same relative depth so the path still resolves
+# correctly after moving the project to Wahab.
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+
+DATA_DIR = os.path.join(_PROJECT_ROOT, "original_data")
+OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "processed_data", "structured_LOS_dynamic")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_CSV = f"{OUTPUT_DIR}/mimic_los_timewindows_wide_v12.1.csv"
 LOG_FILE   = f"{OUTPUT_DIR}/build_mimic_los_dataset_v12.1.log"
@@ -60,6 +71,7 @@ OUTPUTEVENTS_FILE        = f"{DATA_DIR}/OUTPUTEVENTS.csv.gz"
 INPUTEVENTS_MV_FILE      = f"{DATA_DIR}/INPUTEVENTS_MV.csv.gz"
 INPUTEVENTS_CV_FILE      = f"{DATA_DIR}/INPUTEVENTS_CV.csv.gz"
 PROCEDUREEVENTS_MV_FILE  = f"{DATA_DIR}/PROCEDUREEVENTS_MV.csv.gz"
+SERVICES_FILE            = f"{DATA_DIR}/SERVICES.csv"
 
 # ================== V7/V8 Vital ITEMIDs (kept) ===================
 vital_itemids = {
@@ -250,14 +262,20 @@ def main():
         parse_dates=["DOB"]
     ).dropna(subset=["DOB"])
 
-    # Keep FIRST ICU stay per HADM_ID (earliest INTIME)  [UNCHANGED]
-    icustays = (
-        icu_raw.sort_values(["HADM_ID","INTIME"])
-               .groupby("HADM_ID", as_index=False).first()
-    )
+    # --- Cohort filter 1: compute LOS on EVERY ICU stay first (no collapsing
+    # yet), then require LOS_DAYS >= 1.0 day so the 24h feature window can
+    # never run past actual discharge. Matches clean_LOS/build_cohort.py.
+    icu_raw["LOS_DAYS"] = (icu_raw["OUTTIME"] - icu_raw["INTIME"]).dt.total_seconds() / (24*3600)
+    icu_qualified = icu_raw[icu_raw["LOS_DAYS"] >= 1.0].copy()
+
+    # --- Cohort filter 2: exactly ONE qualifying ICU stay per HADM_ID.
+    # Admissions with more than one qualifying stay are dropped entirely
+    # (not anchored on one of them) -- matches clean_LOS/build_cohort.py.
+    stay_counts = icu_qualified.groupby("HADM_ID")["ICUSTAY_ID"].size()
+    single_stay_hadm_ids = set(stay_counts[stay_counts == 1].index)
+    icustays = icu_qualified[icu_qualified["HADM_ID"].isin(single_stay_hadm_ids)].copy()
 
     # Compute ICU LOS labels  [UNCHANGED]
-    icustays["LOS_DAYS"] = (icustays["OUTTIME"] - icustays["INTIME"]).dt.total_seconds() / (24*3600)
     icustays["LOS_label"] = (icustays["LOS_DAYS"] > 7.0).astype("int8")
     conds = [
         icustays["LOS_DAYS"] <= 3.0,
@@ -297,7 +315,20 @@ def main():
     adm_md  = adm_pat.loc[mask, "ADMITTIME"].dt.month * 100 + adm_pat.loc[mask, "ADMITTIME"].dt.day
     dob_md  = adm_pat.loc[mask, "DOB"].dt.month * 100 + adm_pat.loc[mask, "DOB"].dt.day
     y = y - (adm_md < dob_md).astype(int)
-    adm_pat.loc[mask, "AGE"] = y.astype(float).clip(lower=0, upper=120)
+    # MIMIC-III shifts DOB so patients >89 appear ~300y old; the de-identification
+    # convention recovers them as 90, not a raw upper clip of 120.
+    adm_pat.loc[mask, "AGE"] = y.astype(float).clip(lower=0, upper=90)
+
+    # --- Cohort filter 3: age >= 18 at admission (excludes pediatric
+    # admissions) -- matches clean_LOS/build_cohort.py's age>=18 filter.
+    adm_pat = adm_pat[adm_pat["AGE"].notna() & (adm_pat["AGE"] >= 18)].copy()
+
+    # --- Apply cohort filters 1-3 together: an admission is eligible only if
+    # it has exactly one qualifying (LOS>=1) ICU stay AND age>=18.
+    eligible_hadm_ids = set(icustays["HADM_ID"].astype(int)) & set(adm_pat["HADM_ID"].astype(int))
+    icustays = icustays[icustays["HADM_ID"].astype(int).isin(eligible_hadm_ids)].copy()
+    icux = icux[icux["HADM_ID"].astype(int).isin(eligible_hadm_ids)].copy()
+    adm_pat = adm_pat[adm_pat["HADM_ID"].astype(int).isin(eligible_hadm_ids)].copy()
 
     # Normalize GENDER to single letter if needed  [UNCHANGED]
     if adm_pat["GENDER"].dtype == object:
@@ -329,18 +360,49 @@ def main():
     for c in ["ADMISSION_LOCATION", "INSURANCE", "ETHNICITY"]:
         adm_aux[c] = adm_aux[c].astype(str).str.strip().str.upper()
 
-    # 4) Prior ICU count for subject
-    prior = icustays.merge(
-        icustays[["HADM_ID", "INTIME"]].rename(columns={"INTIME": "INDEX_INTIME"}),
-        on="HADM_ID",
+    # 4) Prior ICU count for subject -- BUGFIX: the old version merged
+    # icustays to itself on HADM_ID, so INDEX_INTIME always equaled the row's
+    # own INTIME and "OUTTIME < INDEX_INTIME" was never true (always
+    # comparing a stay's own OUTTIME to its own INTIME) -- PRIOR_ICU_COUNT_SUBJ
+    # was silently always 0/NaN for every row. Fixed by joining on SUBJECT_ID
+    # against the FULL (pre-cohort-filter) ICU stay history, so a subject's
+    # earlier stay still counts even if that earlier admission itself was
+    # later excluded from this cohort (multi-stay / LOS<1 / age<18).
+    icu_all = icu_raw.merge(admissions[["HADM_ID", "SUBJECT_ID"]], on="HADM_ID", how="left")
+    icu_all = icu_all.dropna(subset=["SUBJECT_ID", "INTIME", "OUTTIME"])
+
+    prior = icux[["SUBJECT_ID", "HADM_ID", "INTIME"]].merge(
+        icu_all[["SUBJECT_ID", "HADM_ID", "OUTTIME"]].rename(columns={"HADM_ID": "OTHER_HADM_ID"}),
+        on="SUBJECT_ID",
         how="left",
     )
-    prior = prior[prior["OUTTIME"] < prior["INDEX_INTIME"]]
+    prior = prior[(prior["HADM_ID"] != prior["OTHER_HADM_ID"]) & (prior["OUTTIME"] < prior["INTIME"])]
     prior_cnt = (
-        prior.groupby("HADM_ID")["ICUSTAY_ID"]
-        .count()
+        prior.groupby("HADM_ID")["OTHER_HADM_ID"]
+        .nunique()
         .reset_index(name="PRIOR_ICU_COUNT_SUBJ")
     )
+
+    # 5) Hospital service (XS): CURR_SERVICE of the earliest SERVICES row for
+    # the admission -- single category per admission, one-hot deferred to
+    # preprocessing. Matches clean_LOS/build_structured_features.py:build_services.
+    service_df = None
+    if os.path.exists(SERVICES_FILE):
+        services = _read_csv_maybe_gz(
+            SERVICES_FILE, usecols=["HADM_ID", "TRANSFERTIME", "CURR_SERVICE"]
+        )
+        services = services.dropna(subset=["HADM_ID"]).copy()
+        services["HADM_ID"] = services["HADM_ID"].astype(int)
+        services = services[services["HADM_ID"].isin(eligible_hadm_ids)]
+        services["TRANSFERTIME"] = pd.to_datetime(services["TRANSFERTIME"], errors="coerce")
+        services = services.dropna(subset=["TRANSFERTIME"]).sort_values("TRANSFERTIME")
+        service_df = (
+            services.groupby("HADM_ID", as_index=False).head(1)[["HADM_ID", "CURR_SERVICE"]]
+            .rename(columns={"CURR_SERVICE": "XS"})
+        )
+        service_df["XS"] = service_df["XS"].astype(str).str.strip().str.upper()
+    else:
+        logger.warning("SERVICES file not found; skipping XS (hospital service).")
 
     # --- Merge all into static_cols ---
     static_cols = (
@@ -349,6 +411,8 @@ def main():
         .merge(adm_aux, on="HADM_ID", how="left")
         .merge(prior_cnt, on="HADM_ID", how="left")
     )
+    if service_df is not None:
+        static_cols = static_cols.merge(service_df, on="HADM_ID", how="left")
 
     logger.info("Completed adding new static features.")
 
