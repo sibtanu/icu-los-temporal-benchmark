@@ -54,10 +54,11 @@ def parse_args():
     ap.add_argument("--admissions", default=DEF_ADM)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
-        "--imputer", choices=["knn", "mean"], default="knn",
+        "--imputer", choices=["knn", "mean", "median"], default="knn",
         help="How to fill whatever's left after LOCF: KNN (default, borrows "
-             "values from the most similar TRAIN admissions) or a plain "
-             "train-only column mean fallback.",
+             "values from the most similar TRAIN admissions), or a plain "
+             "train-only column mean/median fallback. median is more robust "
+             "to the skewed distributions common in labs/vitals than mean.",
     )
     ap.add_argument(
         "--n_neighbors", type=int, default=5,
@@ -170,9 +171,13 @@ def main():
             df.loc[idx, impute_cols] = imputed_scaled * train_std.values + train_mean.values
             logger.info(f"  KNN-imputed {split_name}: {len(idx):,} rows")
     elif impute_cols:
-        logger.info("Filling remaining NaNs with TRAIN-ONLY column means...")
-        col_means_remaining = df.loc[train_idx, impute_cols].mean(axis=0, skipna=True)
-        df[impute_cols] = df[impute_cols].fillna(col_means_remaining)
+        stat_name = "medians" if args.imputer == "median" else "means"
+        logger.info(f"Filling remaining NaNs with TRAIN-ONLY column {stat_name}...")
+        if args.imputer == "median":
+            fill_values = df.loc[train_idx, impute_cols].median(axis=0, skipna=True)
+        else:
+            fill_values = df.loc[train_idx, impute_cols].mean(axis=0, skipna=True)
+        df[impute_cols] = df[impute_cols].fillna(fill_values)
 
     if binary_like:
         df[binary_like] = (df[binary_like] > 0.5).astype(int)
