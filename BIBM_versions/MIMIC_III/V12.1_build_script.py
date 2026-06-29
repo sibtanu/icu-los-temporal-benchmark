@@ -57,20 +57,33 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 OUTPUT_CSV = f"{OUTPUT_DIR}/mimic_los_timewindows_wide_v12.1.csv"
 LOG_FILE   = f"{OUTPUT_DIR}/build_mimic_los_dataset_v12.1.log"
 
+def _existing_table_path(data_dir, table_name):
+    """Resolve a raw MIMIC-III table to whichever extension this particular
+    data drop actually has -- the standard PhysioNet distribution ships
+    CHARTEVENTS/OUTPUTEVENTS/INPUTEVENTS_*/PROCEDUREEVENTS_MV gzipped, but
+    some mirrors/clusters (e.g. a pre-decompressed copy) only have the plain
+    .csv. Hardcoding ".csv.gz" crashes with FileNotFoundError on the latter
+    -- this checks what's actually on disk instead of assuming."""
+    gz_path = os.path.join(data_dir, f"{table_name}.csv.gz")
+    plain_path = os.path.join(data_dir, f"{table_name}.csv")
+    if os.path.exists(plain_path):
+        return plain_path
+    return gz_path
+
 # --- Core files (same as V8) ---
 ICUSTAYS_FILE       = f"{DATA_DIR}/ICUSTAYS.csv"
 ADMISSIONS_FILE     = f"{DATA_DIR}/ADMISSIONS.csv"
 PATIENTS_FILE       = f"{DATA_DIR}/PATIENTS.csv"
-CHARTEVENTS_FILE    = f"{DATA_DIR}/CHARTEVENTS.csv.gz"
+CHARTEVENTS_FILE    = _existing_table_path(DATA_DIR, "CHARTEVENTS")
 LABEVENTS_FILE      = f"{DATA_DIR}/LABEVENTS.csv"
 D_LABITEMS_FILE     = f"{DATA_DIR}/D_LABITEMS.csv"
 D_ITEMS_FILE        = f"{DATA_DIR}/D_ITEMS.csv"
 
 # --- V9 additional event files ---
-OUTPUTEVENTS_FILE        = f"{DATA_DIR}/OUTPUTEVENTS.csv.gz"
-INPUTEVENTS_MV_FILE      = f"{DATA_DIR}/INPUTEVENTS_MV.csv.gz"
-INPUTEVENTS_CV_FILE      = f"{DATA_DIR}/INPUTEVENTS_CV.csv.gz"
-PROCEDUREEVENTS_MV_FILE  = f"{DATA_DIR}/PROCEDUREEVENTS_MV.csv.gz"
+OUTPUTEVENTS_FILE        = _existing_table_path(DATA_DIR, "OUTPUTEVENTS")
+INPUTEVENTS_MV_FILE      = _existing_table_path(DATA_DIR, "INPUTEVENTS_MV")
+INPUTEVENTS_CV_FILE      = _existing_table_path(DATA_DIR, "INPUTEVENTS_CV")
+PROCEDUREEVENTS_MV_FILE  = _existing_table_path(DATA_DIR, "PROCEDUREEVENTS_MV")
 SERVICES_FILE            = f"{DATA_DIR}/SERVICES.csv"
 
 # ================== V7/V8 Vital ITEMIDs (kept) ===================
@@ -145,8 +158,15 @@ def _read_csv_maybe_gz(path, **kwargs):
     except ValueError:
         return pd.read_csv(path, compression="gzip", **kwargs)
     except FileNotFoundError:
-        # also try opposite extension (csv <-> csv.gz)
-        alt = path + (".gz" if not path.endswith(".gz") else "").replace(".csv.gz.gz", ".csv.gz")
+        # Also try the OPPOSITE extension -- BUGFIX: the old version only
+        # ever appended ".gz" (handles plain-requested/actually-gzipped),
+        # never stripped it (handles gz-requested/actually-plain, which is
+        # the direction that matters when a cluster's MIMIC-III copy is
+        # already fully decompressed). Try both directions explicitly.
+        if path.endswith(".csv.gz"):
+            alt = path[: -len(".gz")]
+        else:
+            alt = path + ".gz"
         if os.path.exists(alt):
             try:
                 return pd.read_csv(alt, **kwargs)
@@ -527,23 +547,17 @@ def main():
     vit_sum_acc = defaultdict(lambda: defaultdict(float))  # wn -> {(hadm, vital): sum}
     vit_cnt_acc = defaultdict(lambda: defaultdict(int))    # wn -> {(hadm, vital): cnt}
 
-    try:
-        chunk_iter = pd.read_csv(
-            CHARTEVENTS_FILE,
-            usecols=["ICUSTAY_ID","CHARTTIME","ITEMID","VALUENUM"],
-            parse_dates=["CHARTTIME"],
-            chunksize=CHUNK_SIZE,
-            compression="gzip",
-            low_memory=False,
-        )
-    except ValueError:
-        chunk_iter = pd.read_csv(
-            CHARTEVENTS_FILE,
-            usecols=["ICUSTAY_ID","CHARTTIME","ITEMID","VALUENUM"],
-            parse_dates=["CHARTTIME"],
-            chunksize=CHUNK_SIZE,
-            low_memory=False,
-        )
+    # compression="infer" picks gzip/none from the actual file extension --
+    # CHARTEVENTS_FILE already resolved to whichever one exists (see
+    # _existing_table_path), so no try/except guessing is needed here.
+    chunk_iter = pd.read_csv(
+        CHARTEVENTS_FILE,
+        usecols=["ICUSTAY_ID","CHARTTIME","ITEMID","VALUENUM"],
+        parse_dates=["CHARTTIME"],
+        chunksize=CHUNK_SIZE,
+        compression="infer",
+        low_memory=False,
+    )
 
     rows_seen = 0
     for i, ch in enumerate(chunk_iter, start=1):
