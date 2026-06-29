@@ -48,6 +48,7 @@ ACCOUNT=""                  # e.g. ACCOUNT="my_pi_lab" -- leave empty if not req
 PARTITION_CPU="main"          # CPU partition: build/impute/preprocess + combine_results
 PARTITION_GPU="gpu"           # GPU partition for the 6 training jobs -- VERIFY against `sinfo`
 GPUS_PER_JOB="1"
+IMPUTER="median"               # knn (slow at full scale -- timed out at 4h on Wahab), mean, or median
 
 # Wahab wraps conda in a container -- there is no `conda activate`. TWO
 # separate envs, built INTERACTIVELY (never inside a job script -- see
@@ -156,7 +157,7 @@ submit_impute_job () {
          --cpus-per-task=8 \
          --mem=32G \
          --time=04:00:00 \
-         --wrap="${ENV_SETUP} ${PYRUN_DATAPREP} '${SCRIPT_DIR}/V12.1_impute_script.py'"
+         --wrap="${ENV_SETUP} ${PYRUN_DATAPREP} '${SCRIPT_DIR}/V12.1_impute_script.py' --imputer ${IMPUTER}"
 }
 
 submit_preprocess_job () {
