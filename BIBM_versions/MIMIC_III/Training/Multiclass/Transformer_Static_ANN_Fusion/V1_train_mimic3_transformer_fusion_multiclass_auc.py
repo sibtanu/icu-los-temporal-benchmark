@@ -35,7 +35,7 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", ".."
 
 BASE = os.path.join(_PROJECT_ROOT, "processed_data", "structured_LOS_dynamic")
 DATA_DIR = f"{BASE}/lstm_data_v12.1_seq"
-OUT_DIR = os.path.join(_PROJECT_ROOT, "results_LOS_dynamic", "mimic3_transformer_fusion_multiclass_auc_models_v1")
+OUT_DIR = os.path.join(_PROJECT_ROOT, "results_timeseries", "mimic3_transformer_fusion_multiclass_auc_models_v1")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 

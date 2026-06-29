@@ -7,7 +7,7 @@ output directories and writes a single summary CSV with the micro and
 weighted scores (plus macro/accuracy/AUROC/AUPRC for context).
 
 Run after all 6 V1_train_mimic3_*_multiclass_auc.py jobs have finished:
-    python combine_results.py --results_dir <results_LOS_dynamic>
+    python combine_results.py --results_dir <results_timeseries>
 """
 
 import os
@@ -57,7 +57,7 @@ def main():
         "--results_dir",
         default=os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "..",
-            "results_LOS_dynamic",
+            "results_timeseries",
         ),
         help="Parent directory containing each model's *_multiclass_auc_models_v1 output folder.",
     )
