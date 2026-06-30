@@ -126,6 +126,21 @@ declare -a SCRIPTS=(
   "V1_train_mimic3_pure_mamba_multiclass_auc.py"
   "V1_train_mimic3_transformer_fusion_multiclass_auc.py"
 )
+# Per-model CLI overrides on top of the standard hyperparameters -- empty for
+# 5 of 6 (true apples-to-apples comparison). Pure-Mamba is the disclosed
+# exception: under the shared lr=1e-3 it produced NaN/Inf test probabilities
+# and the run was refused (the script's own safety check, not a crash) --
+# confirmed via a manual retry that --lr 3e-4 --grad_clip 0.5 --layers 2
+# converges. Worth reporting as a real finding about this architecture's
+# robustness, not silently normalized away.
+declare -a EXTRA_ARGS=(
+  ""
+  ""
+  ""
+  ""
+  "--lr 3e-4 --grad_clip 0.5 --layers 2"
+  ""
+)
 
 # ------------------------------------------------------------------------------
 # Stage 0: data pipeline (build -> impute -> preprocess), CPU partition.
@@ -187,7 +202,7 @@ echo "  build=${BUILD_JOB} -> impute=${IMPUTE_JOB} -> preprocess=${PREPROCESS_JO
 # 6 are independent of each other and run in parallel once preprocess is done.
 # ------------------------------------------------------------------------------
 submit_train_job () {
-  local job_tag=$1 script_path=$2 dep=$3
+  local job_tag=$1 script_path=$2 dep=$3 extra_args=$4
   local job_name="ts_${job_tag}"
 
   sbatch --parsable \
@@ -201,7 +216,7 @@ submit_train_job () {
          --cpus-per-task=4 \
          --mem=32G \
          --time=04:00:00 \
-         --wrap="${ENV_SETUP} ${PYRUN_TRAIN} '${script_path}' --workers 4"
+         --wrap="${ENV_SETUP} ${PYRUN_TRAIN} '${script_path}' --workers 4 ${extra_args}"
 }
 
 echo "[INFO] Submitting Stage 1 (6 multiclass training jobs)..."
@@ -216,7 +231,7 @@ for i in "${!JOB_TAGS[@]}"; do
     exit 1
   fi
 
-  job_id=$(submit_train_job "${tag}" "${script_path}" "${PREPROCESS_JOB}")
+  job_id=$(submit_train_job "${tag}" "${script_path}" "${PREPROCESS_JOB}" "${EXTRA_ARGS[$i]}")
   echo "  submitted ${tag} -> job ${job_id}"
   ALL_TRAIN_JOB_IDS+=("${job_id}")
 done
