@@ -49,6 +49,10 @@ PARTITION_CPU="main"          # CPU partition: build/impute/preprocess + combine
 PARTITION_GPU="gpu"           # GPU partition for the 6 training jobs -- VERIFY against `sinfo`
 GPUS_PER_JOB="1"
 IMPUTER="median"               # knn (slow at full scale -- timed out at 4h on Wahab), mean, or median
+# strict (default, ~38k admissions): LOS>=1d, single-qualifying-stay, age>=18
+# original (sibtanu's filters, ~50k admissions): first-stay-only, no LOS/age filter
+# Change to "original" to run the comparison experiment.
+COHORT_FILTER="strict"
 
 # Wahab wraps conda in a container -- there is no `conda activate`. TWO
 # separate envs, built INTERACTIVELY (never inside a job script -- see
@@ -157,7 +161,7 @@ submit_build_job () {
          --cpus-per-task=4 \
          --mem=64G \
          --time=08:00:00 \
-         --wrap="${ENV_SETUP} ${PYRUN_DATAPREP} '${SCRIPT_DIR}/V12.1_build_script.py'"
+         --wrap="${ENV_SETUP} ${PYRUN_DATAPREP} '${SCRIPT_DIR}/V12.1_build_script.py' --cohort_filter ${COHORT_FILTER}"
 }
 
 submit_impute_job () {

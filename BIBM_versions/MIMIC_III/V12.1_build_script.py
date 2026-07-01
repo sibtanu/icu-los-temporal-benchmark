@@ -24,9 +24,11 @@ NOTE: No imputation here; a separate preprocessing step handles missingness.
 """
 
 import os
+import sys
 import time
 import logging
 import re
+import argparse
 from collections import defaultdict
 
 import numpy as np
@@ -246,9 +248,27 @@ def load_gcs_itemids():
 
 
 # ===================== MAIN ======================
+def parse_args():
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--cohort_filter", choices=["strict", "original"], default="strict",
+        help=(
+            "strict (default): LOS>=1 day, exactly-one-qualifying-ICU-stay per "
+            "HADM_ID, age>=18, AGE clip 0-90 -- matches clean_LOS/build_cohort.py. "
+            "original: sibtanu's original filters -- first-stay-only (no LOS "
+            "minimum, no single-stay requirement), no age filter, AGE clip 0-120."
+        ),
+    )
+    # Allow unknown args so this script is safe to call from a slurm --wrap
+    # that may pass extra flags intended for other scripts.
+    args, _ = ap.parse_known_args()
+    return args
+
+
 def main():
+    args = parse_args()
     start_t = time.time()
-    logger.info("Building LOS dataset....")
+    logger.info(f"Building LOS dataset.... (cohort_filter={args.cohort_filter})")
 
     # Discover and merge GCS ITEMIDs (after logger exists)
     global ITEMID_TO_LABEL, ALL_CHART_ITEMIDS
@@ -282,18 +302,34 @@ def main():
         parse_dates=["DOB"]
     ).dropna(subset=["DOB"])
 
-    # --- Cohort filter 1: compute LOS on EVERY ICU stay first (no collapsing
-    # yet), then require LOS_DAYS >= 1.0 day so the 24h feature window can
-    # never run past actual discharge. Matches clean_LOS/build_cohort.py.
+    # -----------------------------------------------------------------------
+    # Cohort filtering -- two modes selectable via --cohort_filter:
+    #
+    #   strict   (default): LOS>=1 day, exactly-one-qualifying-stay per
+    #             HADM_ID, age>=18, AGE clip 0-90.  Matches
+    #             clean_LOS/build_cohort.py. Produces ~38k admissions.
+    #
+    #   original: Sibtanu's original filters -- keep first ICU stay per
+    #             HADM_ID (no LOS floor, multi-stay admissions kept),
+    #             no age filter, AGE clip 0-120.  Produces ~50k admissions.
+    #             USE FOR COMPARISON EXPERIMENTS ONLY -- the strict filters
+    #             exist to prevent 24h-window leakage and pediatric mixing.
+    # -----------------------------------------------------------------------
     icu_raw["LOS_DAYS"] = (icu_raw["OUTTIME"] - icu_raw["INTIME"]).dt.total_seconds() / (24*3600)
-    icu_qualified = icu_raw[icu_raw["LOS_DAYS"] >= 1.0].copy()
 
-    # --- Cohort filter 2: exactly ONE qualifying ICU stay per HADM_ID.
-    # Admissions with more than one qualifying stay are dropped entirely
-    # (not anchored on one of them) -- matches clean_LOS/build_cohort.py.
-    stay_counts = icu_qualified.groupby("HADM_ID")["ICUSTAY_ID"].size()
-    single_stay_hadm_ids = set(stay_counts[stay_counts == 1].index)
-    icustays = icu_qualified[icu_qualified["HADM_ID"].isin(single_stay_hadm_ids)].copy()
+    if args.cohort_filter == "strict":
+        # Filter 1: require LOS >= 1 day (24h window can't run past discharge)
+        icu_qualified = icu_raw[icu_raw["LOS_DAYS"] >= 1.0].copy()
+        # Filter 2: exactly ONE qualifying ICU stay per HADM_ID
+        stay_counts = icu_qualified.groupby("HADM_ID")["ICUSTAY_ID"].size()
+        single_stay_hadm_ids = set(stay_counts[stay_counts == 1].index)
+        icustays = icu_qualified[icu_qualified["HADM_ID"].isin(single_stay_hadm_ids)].copy()
+    else:  # original
+        # Keep FIRST ICU stay per HADM_ID (no LOS floor, multi-stay kept)
+        icustays = (
+            icu_raw.sort_values(["HADM_ID", "INTIME"])
+                   .groupby("HADM_ID", as_index=False).first()
+        )
 
     # Compute ICU LOS labels  [UNCHANGED]
     icustays["LOS_label"] = (icustays["LOS_DAYS"] > 7.0).astype("int8")
@@ -335,20 +371,22 @@ def main():
     adm_md  = adm_pat.loc[mask, "ADMITTIME"].dt.month * 100 + adm_pat.loc[mask, "ADMITTIME"].dt.day
     dob_md  = adm_pat.loc[mask, "DOB"].dt.month * 100 + adm_pat.loc[mask, "DOB"].dt.day
     y = y - (adm_md < dob_md).astype(int)
-    # MIMIC-III shifts DOB so patients >89 appear ~300y old; the de-identification
-    # convention recovers them as 90, not a raw upper clip of 120.
-    adm_pat.loc[mask, "AGE"] = y.astype(float).clip(lower=0, upper=90)
 
-    # --- Cohort filter 3: age >= 18 at admission (excludes pediatric
-    # admissions) -- matches clean_LOS/build_cohort.py's age>=18 filter.
-    adm_pat = adm_pat[adm_pat["AGE"].notna() & (adm_pat["AGE"] >= 18)].copy()
+    if args.cohort_filter == "strict":
+        # MIMIC-III shifts DOB so patients >89 appear ~300y old; the
+        # de-identification convention recovers them as 90.
+        adm_pat.loc[mask, "AGE"] = y.astype(float).clip(lower=0, upper=90)
+        # Filter 3: age >= 18 at admission
+        adm_pat = adm_pat[adm_pat["AGE"].notna() & (adm_pat["AGE"] >= 18)].copy()
+    else:  # original
+        adm_pat.loc[mask, "AGE"] = y.astype(float).clip(lower=0, upper=120)
 
-    # --- Apply cohort filters 1-3 together: an admission is eligible only if
-    # it has exactly one qualifying (LOS>=1) ICU stay AND age>=18.
+    # Apply cohort filters together
     eligible_hadm_ids = set(icustays["HADM_ID"].astype(int)) & set(adm_pat["HADM_ID"].astype(int))
     icustays = icustays[icustays["HADM_ID"].astype(int).isin(eligible_hadm_ids)].copy()
     icux = icux[icux["HADM_ID"].astype(int).isin(eligible_hadm_ids)].copy()
     adm_pat = adm_pat[adm_pat["HADM_ID"].astype(int).isin(eligible_hadm_ids)].copy()
+    logger.info(f"Cohort after filtering ({args.cohort_filter}): {len(icustays):,} admissions")
 
     # Normalize GENDER to single letter if needed  [UNCHANGED]
     if adm_pat["GENDER"].dtype == object:
@@ -1997,7 +2035,7 @@ def main():
 
     # Save
     final.to_csv(OUTPUT_CSV, index=False)
-    logger.info(f"Saved: {OUTPUT_CSV}  Rows={len(final):,}  Cols={final.shape[1]}")
+    logger.info(f"Saved: {OUTPUT_CSV}  Rows={len(final):,}  Cols={final.shape[1]}  (cohort_filter={args.cohort_filter})")
     logger.info(f"---- LOS build V12.1 done ----  Elapsed={time.time()-start_t:.1f}s")
 
 if __name__ == "__main__":
