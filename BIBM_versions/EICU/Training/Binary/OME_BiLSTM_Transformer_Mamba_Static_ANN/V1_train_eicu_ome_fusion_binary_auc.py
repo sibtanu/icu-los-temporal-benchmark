@@ -1,44 +1,52 @@
 #!/usr/bin/env python3
 """
-V1_train_eicu_ome_fusion_binary_auc.py
---------------------------------------
+V1_train_mimic3_ome_fusion_binary_auc.py
+-----------------------------------------
 
-OME-Fusion Multi-Encoder Fusion for eICU binary LOS prediction
-with AUROC/AUPRC reporting and validation macro-F1 threshold tuning.
+OME-Fusion: Binary Multi-Encoder Fusion for eICU LOS prediction.
 
-Architecture:
-    Dynamic 24h ICU sequence encoded in parallel by:
-        1) BiLSTM encoder
-        2) Transformer encoder
-        3) Pure Mamba encoder
+Dynamic 24h ICU sequence is encoded in parallel by:
+    1) BiLSTM encoder
+    2) Transformer encoder
+    3) Pure Mamba encoder
 
-    Static features encoded by:
-        4) Static ANN
+Static features are encoded by:
+    4) Static ANN
 
-    Fusion:
-        [BiLSTM + Transformer + Mamba + Static]
-        -> branch attention
-        -> gated fusion
-        -> binary 2-class head
+Then:
+    [LSTM + Transformer + Mamba + Static]
+    -> gated fusion
+    -> binary 2-logit head
+
+Expected files:
+    /lustre/home/rahas2/mimic_projects/outputs/lstm_data_v12.1_seq
+
+    X_dyn_train.npy
+    X_dyn_valid.npy
+    X_dyn_test.npy
+    X_static_train.npy
+    X_static_valid.npy
+    X_static_test.npy
+    y_bin_train.npy
+    y_bin_valid.npy
+    y_bin_test.npy
 
 Task:
     Binary LOS:
         0 = LOS <= 7 days
         1 = LOS > 7 days
 
-Reads:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_lstm_data_v1
+Output folder:
+    /lustre/home/rahas2/mimic_projects/outputs/mimic3_ome_fusion_binary_auc_models_v1
 
-Expected files:
-    X_dyn_train.npy / valid / test
-    X_static_train.npy / valid / test
-    y_bin_train.npy / valid / test
-
-Outputs:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_ome_fusion_binary_auc_models_v1
+Requires:
+    mamba_ssm
 
 Run:
-    python V1_train_eicu_ome_fusion_binary_auc.py --workers 0 --batch 128
+    python V1_train_mimic3_ome_fusion_binary_auc.py --workers 0 --batch 128
+
+Optional if stable and you want speed:
+    python V1_train_mimic3_ome_fusion_binary_auc.py --workers 0 --batch 128 --amp
 """
 
 import os
@@ -70,9 +78,17 @@ except Exception as e:
         f"Original error: {repr(e)}"
     )
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
+
+# ======================================================
+# CONFIG
+# ======================================================
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
 _EICU_RESULTS = os.path.join(_PROJECT_ROOT, "results_eicu")
 DATA_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_data_v1")
 OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_ome_fusion_binary_auc_models_v1")
@@ -80,12 +96,20 @@ OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_ome_fusion_binary_auc_models_v1")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
+# ======================================================
+# SEED
+# ======================================================
+
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
+# ======================================================
+# DATASET
+# ======================================================
 
 class DynStaticBinaryDataset(Dataset):
     def __init__(self, X_dyn, X_static, y_bin):
@@ -113,7 +137,7 @@ def make_loaders(
     X_dyn_test,
     X_static_test,
     y_test,
-    batch=128,
+    batch=256,
     workers=0,
 ):
     kwargs = dict(
@@ -123,12 +147,57 @@ def make_loaders(
         persistent_workers=(workers > 0),
     )
 
-    return (
-        DataLoader(DynStaticBinaryDataset(X_dyn_train, X_static_train, y_train), shuffle=True, **kwargs),
-        DataLoader(DynStaticBinaryDataset(X_dyn_valid, X_static_valid, y_valid), shuffle=False, **kwargs),
-        DataLoader(DynStaticBinaryDataset(X_dyn_test, X_static_test, y_test), shuffle=False, **kwargs),
+    train_loader = DataLoader(
+        DynStaticBinaryDataset(X_dyn_train, X_static_train, y_train),
+        shuffle=True,
+        **kwargs,
     )
 
+    valid_loader = DataLoader(
+        DynStaticBinaryDataset(X_dyn_valid, X_static_valid, y_valid),
+        shuffle=False,
+        **kwargs,
+    )
+
+    test_loader = DataLoader(
+        DynStaticBinaryDataset(X_dyn_test, X_static_test, y_test),
+        shuffle=False,
+        **kwargs,
+    )
+
+    return train_loader, valid_loader, test_loader
+
+
+# ======================================================
+# BINARY HELPERS
+# ======================================================
+
+def binary_probs_to_class(prob_pos, threshold):
+    return (prob_pos >= threshold).astype(np.int64)
+
+
+def tune_binary_threshold(y_true, prob_pos):
+    best = {
+        "f1": -1.0,
+        "acc": 0.0,
+        "threshold": 0.5,
+    }
+
+    for t in np.arange(0.05, 0.96, 0.01):
+        pred = binary_probs_to_class(prob_pos, t)
+        f1 = f1_score(y_true, pred, average="macro", zero_division=0)
+
+        if f1 > best["f1"]:
+            best["f1"] = float(f1)
+            best["acc"] = float(accuracy_score(y_true, pred))
+            best["threshold"] = float(t)
+
+    return best
+
+
+# ======================================================
+# ENCODER BLOCKS
+# ======================================================
 
 class MambaBlock(nn.Module):
     def __init__(
@@ -140,13 +209,16 @@ class MambaBlock(nn.Module):
         dropout: float = 0.15,
     ):
         super().__init__()
+
         self.norm = nn.LayerNorm(d_model)
+
         self.mamba = Mamba(
             d_model=d_model,
             d_state=d_state,
             d_conv=d_conv,
             expand=expand,
         )
+
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -163,7 +235,9 @@ class BiLSTMEncoder(nn.Module):
         out_dim: int = 192,
     ):
         super().__init__()
+
         self.norm = nn.LayerNorm(dyn_dim)
+
         self.lstm = nn.LSTM(
             input_size=dyn_dim,
             hidden_size=hidden,
@@ -172,6 +246,7 @@ class BiLSTMEncoder(nn.Module):
             bidirectional=True,
             dropout=dropout if layers > 1 else 0.0,
         )
+
         self.proj = nn.Sequential(
             nn.Linear(hidden * 4, out_dim),
             nn.GELU(),
@@ -182,10 +257,12 @@ class BiLSTMEncoder(nn.Module):
     def forward(self, x):
         x = self.norm(x)
         out, (hn, _) = self.lstm(x)
+
         h_fwd = hn[-2]
         h_bwd = hn[-1]
         h_last = torch.cat([h_fwd, h_bwd], dim=1)
         h_mean = out.mean(dim=1)
+
         return self.proj(torch.cat([h_last, h_mean], dim=1))
 
 
@@ -333,7 +410,21 @@ class PureMambaEncoderBranch(nn.Module):
         return self.out(torch.cat([h_last, h_mean], dim=1))
 
 
+# ======================================================
+# OME-FUSION MODEL
+# ======================================================
+
 class OMEFusionBinary(nn.Module):
+    """
+    Binary Multi-Encoder Fusion:
+        BiLSTM branch
+        Transformer branch
+        Mamba branch
+        Static ANN branch
+
+    Then gated fusion -> binary 2-logit head.
+    """
+
     def __init__(
         self,
         dyn_dim: int,
@@ -405,32 +496,24 @@ class OMEFusionBinary(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Small learned branch attention over LSTM / Transformer / Mamba.
         self.branch_score = nn.Sequential(
             nn.Linear(branch_dim, branch_dim // 2),
             nn.Tanh(),
             nn.Linear(branch_dim // 2, 1),
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(fusion_dim, 384),
-            nn.GELU(),
-            nn.LayerNorm(384),
-            nn.Dropout(dropout),
-            nn.Linear(384, 192),
-            nn.GELU(),
-            nn.LayerNorm(192),
-            nn.Dropout(dropout),
-            nn.Linear(192, 2),
-        )
+        self.head = build_standard_head(fusion_dim, n_classes=2)
 
     def forward(self, x_dyn, x_static):
         h_lstm = self.lstm_branch(x_dyn)
         h_trf = self.transformer_branch(x_dyn)
         h_mamba = self.mamba_branch(x_dyn)
 
-        branches = torch.stack([h_lstm, h_trf, h_mamba], dim=1)
-        scores = self.branch_score(branches).squeeze(-1)
-        weights = torch.softmax(scores, dim=1).unsqueeze(-1)
+        # Branch attention rescales dynamic branches but keeps all branches available.
+        branches = torch.stack([h_lstm, h_trf, h_mamba], dim=1)  # (B,3,D)
+        scores = self.branch_score(branches).squeeze(-1)        # (B,3)
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1)    # (B,3,1)
         branches = branches * weights
 
         h_lstm = branches[:, 0, :]
@@ -444,25 +527,16 @@ class OMEFusionBinary(nn.Module):
         fused = self.fusion_ln(fused)
 
         gate = self.fusion_gate(fused)
-        return self.head(fused * gate)
+        fused = fused * gate
+
+        return self.head(fused)
 
 
-def tune_binary_threshold(y_true, prob_pos):
-    best = {"threshold": 0.5, "f1": -1.0, "acc": 0.0}
 
-    for t in np.arange(0.05, 0.96, 0.01):
-        pred = (prob_pos >= t).astype(np.int64)
-        f1 = f1_score(y_true, pred, average="macro", zero_division=0)
 
-        if f1 > best["f1"]:
-            best = {
-                "threshold": float(t),
-                "f1": float(f1),
-                "acc": float(accuracy_score(y_true, pred)),
-            }
-
-    return best
-
+# ======================================================
+# TRAIN / EVAL
+# ======================================================
 
 def train_epoch(
     model,
@@ -509,7 +583,7 @@ def train_epoch(
             optimizer.step()
 
         bs = y.size(0)
-        loss_sum += float(loss.detach().cpu().item()) * bs
+        loss_sum += loss.item() * bs
         n += bs
 
     return loss_sum / max(n, 1)
@@ -541,26 +615,30 @@ def eval_epoch(model, loader, device, criterion, amp: bool = False):
         probs = torch.softmax(logits, dim=1)
 
         bs = y.size(0)
-        loss_sum += float(loss.detach().cpu().item()) * bs
+        loss_sum += loss.item() * bs
         n += bs
 
         probs_all.append(probs.detach().cpu().numpy())
         y_all.append(y.detach().cpu().numpy())
 
-    probs_all = np.concatenate(probs_all) if probs_all else np.empty((0, 2))
+    probs_all = np.concatenate(probs_all) if probs_all else np.array([])
     y_all = np.concatenate(y_all) if y_all else np.array([])
 
     return loss_sum / max(n, 1), probs_all, y_all
 
 
+# ======================================================
+# MAIN
+# ======================================================
+
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
 
     parser.add_argument("--branch_dim", type=int, default=192)
     parser.add_argument("--lstm_hidden", type=int, default=192)
@@ -574,7 +652,7 @@ def main():
     parser.add_argument("--expand", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.15)
 
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
     parser.add_argument("--amp", action="store_true")
 
     args = parser.parse_args()
@@ -584,7 +662,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("USING eICU OME-FUSION BINARY WITH AUROC/AUPRC")
-    print("Multi-Encoder Fusion: BiLSTM + Transformer + Mamba + Static ANN")
+    print("Binary Multi-Encoder Fusion: BiLSTM + Transformer + Mamba + Static ANN")
     print(f"Device: {device}")
     print(f"DATA_DIR: {DATA_DIR}")
     print(f"OUT_DIR: {OUT_DIR}")
@@ -604,17 +682,19 @@ def main():
     print(f"Loaded dyn: train={X_dyn_train.shape}, valid={X_dyn_valid.shape}, test={X_dyn_test.shape}")
     print(f"Loaded static: train={X_static_train.shape}, valid={X_static_valid.shape}, test={X_static_test.shape}")
 
-    class_counts = np.bincount(y_train, minlength=2)
+    class_counts = np.bincount(y_train.astype(np.int64), minlength=2)
     print("Train class counts:", class_counts)
 
-    weights = class_counts.sum() / (class_counts + 1e-9)
-    weights = weights / weights.sum()
-    class_weights = torch.tensor(weights, dtype=torch.float32, device=device)
+    n_total = class_counts.sum()
+    class_weights = n_total / np.maximum(2.0 * class_counts, 1.0)
+    class_weights = class_weights.astype(np.float32)
 
-    print("Using weighted CrossEntropyLoss with validation macro-F1 threshold tuning.")
-    print("Class weights:", weights.tolist())
+    print("Using CrossEntropyLoss with validation threshold tuning.")
+    print("Class weights:", class_weights.tolist())
 
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(
+        weight=torch.tensor(class_weights, dtype=torch.float32, device=device)
+    )
 
     tr_loader, va_loader, te_loader = make_loaders(
         X_dyn_train,
@@ -661,18 +741,8 @@ def main():
         f"nhead={args.nhead}, d_state={args.d_state}"
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4,
-    )
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3,
-    )
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
 
     scaler = torch.cuda.amp.GradScaler(
         enabled=(args.amp and device.type == "cuda")
@@ -706,9 +776,14 @@ def main():
             amp=(args.amp and device.type == "cuda"),
         )
 
-        threshold_info = tune_binary_threshold(val_true, val_probs[:, 1])
+        threshold_info = tune_binary_threshold(
+            val_true,
+            val_probs[:, 1],
+        )
+
         val_f1 = threshold_info["f1"]
         val_acc = threshold_info["acc"]
+
         scheduler.step(val_f1)
 
         print(
@@ -747,15 +822,27 @@ def main():
         amp=(args.amp and device.type == "cuda"),
     )
 
-    prob_pos = test_probs[:, 1]
-    test_pred = (prob_pos >= best_threshold).astype(np.int64)
+    test_prob_pos = test_probs[:, 1]
+    test_pred = binary_probs_to_class(test_prob_pos, best_threshold)
 
     test_acc = accuracy_score(test_true, test_pred)
-    test_f1_macro = f1_score(test_true, test_pred, average="macro", zero_division=0)
-    test_f1_weighted = f1_score(test_true, test_pred, average="weighted", zero_division=0)
 
-    test_auroc = roc_auc_score(test_true, prob_pos)
-    test_auprc = average_precision_score(test_true, prob_pos)
+    test_f1_macro = f1_score(
+        test_true,
+        test_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    test_f1_weighted = f1_score(
+        test_true,
+        test_pred,
+        average="weighted",
+        zero_division=0,
+    )
+
+    test_auroc = roc_auc_score(test_true, test_prob_pos)
+    test_auprc = average_precision_score(test_true, test_prob_pos)
 
     report = classification_report(
         test_true,
@@ -768,13 +855,13 @@ def main():
     cm = confusion_matrix(test_true, test_pred).tolist()
 
     stamp = (
-        f"eicu_v1_ome_fusion_binary_auc_"
+        f"mimic3_ome_fusion_binary_"
         f"B{args.branch_dim}_"
         f"LSTM{args.lstm_layers}_TRF{args.transformer_layers}_MAMBA{args.mamba_layers}_"
         f"Fdyn{dyn_dim}_Fstat{static_dim}"
     )
 
-    model_path = os.path.join(OUT_DIR, f"ome_fusion_binary_auc_{stamp}.pt")
+    model_path = os.path.join(OUT_DIR, f"ome_fusion_binary_{stamp}.pt")
     metrics_path = os.path.join(OUT_DIR, f"metrics_{stamp}.json")
 
     torch.save(
@@ -796,6 +883,7 @@ def main():
             "dropout": float(args.dropout),
             "num_classes": 2,
             "label": "binary",
+            "class_weights": class_weights.tolist(),
             "best_epoch": int(best_epoch),
             "best_val_f1": float(best_val_f1),
             "best_val_loss": float(best_val_loss),
@@ -825,7 +913,7 @@ def main():
         "threshold_grid": "np.arange(0.05, 0.96, 0.01)",
         "elapsed_sec": round(time.time() - t0, 1),
         "class_counts_train": class_counts.tolist(),
-        "class_weights": weights.tolist(),
+        "class_weights": class_weights.tolist(),
         "train_shape_dyn": list(X_dyn_train.shape),
         "valid_shape_dyn": list(X_dyn_valid.shape),
         "test_shape_dyn": list(X_dyn_test.shape),
@@ -838,7 +926,6 @@ def main():
         "transformer_layers": int(args.transformer_layers),
         "mamba_layers": int(args.mamba_layers),
         "checkpoint_metric": "validation_macro_f1",
-        "binary_threshold_tuned_on": "validation_macro_f1",
         "positive_class": "LOS_gt_7_days",
         "output_dir": OUT_DIR,
     }
@@ -848,7 +935,6 @@ def main():
 
     print(f"\nSaved model:   {model_path}")
     print(f"Saved metrics: {metrics_path}")
-
     print(
         f"Test Acc: {test_acc:.4f} | "
         f"F1 macro: {test_f1_macro:.4f} | "

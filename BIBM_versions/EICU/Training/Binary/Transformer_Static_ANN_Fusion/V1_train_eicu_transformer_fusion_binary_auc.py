@@ -1,49 +1,21 @@
 #!/usr/bin/env python3
 """
-V1_train_eicu_transformer_fusion_binary_auc.py
-------------------------------------------
+V1_train_mimic3_transformer_fusion_binary_auc.py
 
-eICU Transformer + static ANN fusion model for BINARY LOS prediction.
-
-Reads the SAME files as the other eICU training scripts:
-
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_lstm_data_v1
-
-Expected files:
-    X_dyn_train.npy
-    X_dyn_valid.npy
-    X_dyn_test.npy
-    X_static_train.npy
-    X_static_valid.npy
-    X_static_test.npy
-    y_bin_train.npy
-    y_bin_valid.npy
-    y_bin_test.npy
+eICU Transformer + Static ANN Fusion Binary LOS prediction.
 
 Task:
-    Binary LOS:
-        0 = LOS <= 7 days
-        1 = LOS > 7 days
+    0 = LOS <= 7 days
+    1 = LOS > 7 days
 
-Architecture:
-    - dynamic feature LayerNorm
-    - dynamic projection MLP per timestep
-    - learned positional embeddings
-    - static ANN -> CLS/context token
-    - Transformer encoder over [static CLS + 24 hourly dynamic tokens]
-    - CLS pooled binary classifier head
-    - validation macro-F1 checkpointing
-    - validation threshold tuning for positive class
+Reads:
+    DATA_DIR (computed relative to project root -- see CONFIG section below)
 
-Output folder:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_transformer_fusion_binary_auc_models_v1
+Outputs:
+    OUT_DIR (computed relative to project root -- see CONFIG section below)
 
-This folder is intentionally separate from:
-    eicu_lstm_models_v1
-    eicu_lstm_fusion_ordinal_models_v1
-    eicu_hybrid_lstm_mamba_models_v1
-    eicu_hybrid_lstm_mamba_ordinal_models_v1
-    eicu_transformer_fusion_ordinal_models_v1
+Run:
+    python V1_train_mimic3_transformer_fusion_binary_auc.py --workers 0 --batch 128
 """
 
 import os
@@ -51,8 +23,8 @@ import json
 import time
 import random
 import argparse
-import numpy as np
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -66,13 +38,13 @@ from sklearn.metrics import (
     average_precision_score,
 )
 
-
-# ======================================================
-# CONFIG
-# ======================================================
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
 _EICU_RESULTS = os.path.join(_PROJECT_ROOT, "results_eicu")
 DATA_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_data_v1")
 OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_transformer_fusion_binary_auc_models_v1")
@@ -80,20 +52,12 @@ OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_transformer_fusion_binary_auc_models
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
-# ======================================================
-# SEED
-# ======================================================
-
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
-# ======================================================
-# DATASET
-# ======================================================
 
 class DynStaticBinaryDataset(Dataset):
     def __init__(self, X_dyn, X_static, y_bin):
@@ -131,92 +95,38 @@ def make_loaders(
         persistent_workers=(workers > 0),
     )
 
-    train_loader = DataLoader(
-        DynStaticBinaryDataset(X_dyn_train, X_static_train, y_train),
-        shuffle=True,
-        **kwargs,
+    return (
+        DataLoader(DynStaticBinaryDataset(X_dyn_train, X_static_train, y_train), shuffle=True, **kwargs),
+        DataLoader(DynStaticBinaryDataset(X_dyn_valid, X_static_valid, y_valid), shuffle=False, **kwargs),
+        DataLoader(DynStaticBinaryDataset(X_dyn_test, X_static_test, y_test), shuffle=False, **kwargs),
     )
 
-    valid_loader = DataLoader(
-        DynStaticBinaryDataset(X_dyn_valid, X_static_valid, y_valid),
-        shuffle=False,
-        **kwargs,
-    )
-
-    test_loader = DataLoader(
-        DynStaticBinaryDataset(X_dyn_test, X_static_test, y_test),
-        shuffle=False,
-        **kwargs,
-    )
-
-    return train_loader, valid_loader, test_loader
-
-
-# ======================================================
-# THRESHOLD TUNING
-# ======================================================
 
 def tune_binary_threshold(y_true, prob_pos):
-    """
-    Tune positive-class probability threshold on validation macro F1.
-    """
-    best_t = 0.5
-    best_f1 = -1.0
-    best_acc = 0.0
+    best = {"threshold": 0.5, "f1": -1.0, "acc": 0.0}
 
     for t in np.arange(0.05, 0.96, 0.01):
         pred = (prob_pos >= t).astype(np.int64)
         f1 = f1_score(y_true, pred, average="macro", zero_division=0)
 
-        if f1 > best_f1:
-            best_f1 = float(f1)
-            best_t = float(t)
-            best_acc = float(accuracy_score(y_true, pred))
+        if f1 > best["f1"]:
+            best["threshold"] = float(t)
+            best["f1"] = float(f1)
+            best["acc"] = float(accuracy_score(y_true, pred))
 
-    return {
-        "threshold": best_t,
-        "f1": best_f1,
-        "acc": best_acc,
-    }
+    return best
 
 
-# ======================================================
-# MODEL
-# ======================================================
-
-class TransformerStaticBinaryFusion(nn.Module):
-    """
-    Transformer temporal encoder with static ANN CLS token.
-
-    Dynamic path:
-        X_dyn: (B, 24, F_dyn)
-        LayerNorm(F_dyn)
-        MLP projection to d_model
-
-    Static path:
-        X_static: (B, F_static)
-        LayerNorm(F_static)
-        MLP projection to d_model
-        used as CLS/context token
-
-    Sequence:
-        [static_CLS, dyn_t0, ..., dyn_t23]
-
-    Output:
-        two binary logits for classes:
-            0 = LOS <= 7 days
-            1 = LOS > 7 days
-    """
-
+class LOSTransformerBinaryV127(nn.Module):
     def __init__(
         self,
         dyn_dim: int,
         static_dim: int,
-        d_model: int = 192,
-        nhead: int = 6,
-        num_layers: int = 3,
-        ff_dim: int = 384,
-        dropout: float = 0.15,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 2,
+        dim_feedforward: int = 256,
+        dropout: float = 0.1,
         max_timesteps: int = 24,
     ):
         super().__init__()
@@ -225,66 +135,41 @@ class TransformerStaticBinaryFusion(nn.Module):
             raise ValueError("d_model must be divisible by nhead.")
 
         self.max_timesteps = max_timesteps
-        self.d_model = d_model
 
         self.dyn_norm = nn.LayerNorm(dyn_dim)
         self.static_norm = nn.LayerNorm(static_dim)
 
-        self.dyn_proj = nn.Sequential(
+        self.dyn_mlp = nn.Sequential(
             nn.Linear(dyn_dim, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
+            nn.ReLU(),
             nn.LayerNorm(d_model),
         )
 
-        self.static_proj = nn.Sequential(
+        self.static_mlp = nn.Sequential(
             nn.Linear(static_dim, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
+            nn.ReLU(),
             nn.LayerNorm(d_model),
         )
 
         self.pos_embed = nn.Embedding(max_timesteps + 1, d_model)
-
-        # Mild learnable temporal decay.
-        self.time_decay = nn.Parameter(torch.tensor(0.03))
+        self.time_decay = nn.Parameter(torch.tensor(0.05))
+        self.pre_ln = nn.LayerNorm(d_model)
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
-            dim_feedforward=ff_dim,
+            dim_feedforward=dim_feedforward,
             dropout=dropout,
-            activation="gelu",
             batch_first=True,
-            norm_first=True,
+            activation="gelu",
         )
 
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=num_layers,
-        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        self.final_ln = nn.LayerNorm(d_model)
-
-        self.head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model // 2, 2),
-        )
+        self.head = build_standard_head(d_model, n_classes=2)
 
     def forward(self, x_dyn, x_static):
-        B, T, _ = x_dyn.shape
+        _, T, _ = x_dyn.shape
 
         if T > self.max_timesteps:
             raise ValueError(f"Unexpected T={T}, max_timesteps={self.max_timesteps}")
@@ -292,43 +177,27 @@ class TransformerStaticBinaryFusion(nn.Module):
         x_dyn = self.dyn_norm(x_dyn)
         x_static = self.static_norm(x_static)
 
-        dyn_tokens = self.dyn_proj(x_dyn)
+        dyn_tokens = self.dyn_mlp(x_dyn)
 
         time_idx = torch.arange(T, device=x_dyn.device, dtype=torch.float32)
         decay = torch.exp(-torch.clamp(self.time_decay, 0.0, 1.0) * time_idx)
         dyn_tokens = dyn_tokens * decay.view(1, T, 1)
 
-        cls_token = self.static_proj(x_static).unsqueeze(1)
-
+        cls_token = self.static_mlp(x_static).unsqueeze(1)
         tokens = torch.cat([cls_token, dyn_tokens], dim=1)
 
         pos_ids = torch.arange(tokens.size(1), device=tokens.device).unsqueeze(0)
         tokens = tokens + self.pos_embed(pos_ids)
 
+        tokens = self.pre_ln(tokens)
         encoded = self.encoder(tokens)
 
-        cls_out = self.final_ln(encoded[:, 0, :])
-
+        cls_out = encoded[:, 0, :]
         return self.head(cls_out)
 
 
-# ======================================================
-# TRAIN / EVAL
-# ======================================================
-
-def train_epoch(
-    model,
-    loader,
-    device,
-    criterion,
-    optimizer,
-    scheduler=None,
-    scaler=None,
-    amp: bool = False,
-    grad_clip: float = 1.0,
-):
+def train_epoch(model, loader, device, criterion, optimizer, scheduler=None, grad_clip=1.0):
     model.train()
-
     loss_sum = 0.0
     n = 0
 
@@ -338,31 +207,18 @@ def train_epoch(
         y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
+        logits = model(Xd, Xs)
+        loss = criterion(logits, y)
 
-        if amp and scaler is not None and device.type == "cuda":
-            with torch.cuda.amp.autocast():
-                logits = model(Xd, Xs)
-                loss = criterion(logits, y)
+        if not torch.isfinite(loss):
+            raise RuntimeError("Loss became NaN/Inf.")
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+        loss.backward()
+
+        if grad_clip is not None:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
 
-        else:
-            logits = model(Xd, Xs)
-            loss = criterion(logits, y)
-
-            if not torch.isfinite(loss):
-                raise RuntimeError("Loss became NaN/Inf.")
-
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
-
-        if scheduler is not None:
-            scheduler.step()
+        optimizer.step()
 
         bs = y.size(0)
         loss_sum += loss.item() * bs
@@ -372,12 +228,11 @@ def train_epoch(
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, device, criterion, amp: bool = False):
+def eval_epoch(model, loader, device, criterion):
     model.eval()
 
     loss_sum = 0.0
     n = 0
-
     probs_all = []
     y_all = []
 
@@ -386,14 +241,8 @@ def eval_epoch(model, loader, device, criterion, amp: bool = False):
         Xs = Xs.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
 
-        if amp and device.type == "cuda":
-            with torch.cuda.amp.autocast():
-                logits = model(Xd, Xs)
-                loss = criterion(logits, y)
-        else:
-            logits = model(Xd, Xs)
-            loss = criterion(logits, y)
-
+        logits = model(Xd, Xs)
+        loss = criterion(logits, y)
         probs = torch.softmax(logits, dim=1)
 
         bs = y.size(0)
@@ -403,31 +252,26 @@ def eval_epoch(model, loader, device, criterion, amp: bool = False):
         probs_all.append(probs.detach().cpu().numpy())
         y_all.append(y.detach().cpu().numpy())
 
-    probs_all = np.concatenate(probs_all) if probs_all else np.array([])
+    probs_all = np.concatenate(probs_all) if probs_all else np.empty((0, 2))
     y_all = np.concatenate(y_all) if y_all else np.array([])
 
     return loss_sum / max(n, 1), probs_all, y_all
 
 
-# ======================================================
-# MAIN
-# ======================================================
-
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
-    parser.add_argument("--d_model", type=int, default=192)
-    parser.add_argument("--nhead", type=int, default=6)
-    parser.add_argument("--layers", type=int, default=3)
-    parser.add_argument("--ff_dim", type=int, default=384)
-    parser.add_argument("--dropout", type=float, default=0.15)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--amp", action="store_true")
+    parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
+    parser.add_argument("--d_model", type=int, default=128)
+    parser.add_argument("--nhead", type=int, default=4)
+    parser.add_argument("--layers", type=int, default=2)
+    parser.add_argument("--ff_dim", type=int, default=256)
+    parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
 
     args = parser.parse_args()
 
@@ -435,7 +279,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("USING eICU TRANSFORMER + ANN FUSION BINARY WITH AUROC/AUPRC")
+    print("USING eICU TRANSFORMER + STATIC ANN FUSION BINARY WITH AUROC/AUPRC")
     print(f"Device: {device}")
     print(f"DATA_DIR: {DATA_DIR}")
     print(f"OUT_DIR: {OUT_DIR}")
@@ -467,7 +311,7 @@ def main():
 
     criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    tr_loader, va_loader, te_loader = make_loaders(
+    train_loader, valid_loader, test_loader = make_loaders(
         X_dyn_train,
         X_static_train,
         y_train,
@@ -484,36 +328,19 @@ def main():
     dyn_dim = X_dyn_train.shape[2]
     static_dim = X_static_train.shape[1]
 
-    model = TransformerStaticBinaryFusion(
+    model = LOSTransformerBinaryV127(
         dyn_dim=dyn_dim,
         static_dim=static_dim,
         d_model=args.d_model,
         nhead=args.nhead,
         num_layers=args.layers,
-        ff_dim=args.ff_dim,
+        dim_feedforward=args.ff_dim,
         dropout=args.dropout,
         max_timesteps=X_dyn_train.shape[1],
     ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4,
-    )
-
-    total_steps = args.epochs * max(len(tr_loader), 1)
-    warmup_steps = max(1, int(0.05 * total_steps))
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return float(step + 1) / float(warmup_steps)
-        return 1.0
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-    scaler = torch.cuda.amp.GradScaler(
-        enabled=(args.amp and device.type == "cuda")
-    )
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
 
     best_val_f1 = -1.0
     best_val_loss = float("inf")
@@ -526,32 +353,25 @@ def main():
     for epoch in range(1, args.epochs + 1):
         train_loss = train_epoch(
             model,
-            tr_loader,
+            train_loader,
             device,
             criterion,
             optimizer,
             scheduler=scheduler,
-            scaler=scaler,
-            amp=(args.amp and device.type == "cuda"),
             grad_clip=args.grad_clip,
         )
 
         val_loss, val_probs, val_true = eval_epoch(
             model,
-            va_loader,
+            valid_loader,
             device,
             criterion,
-            amp=(args.amp and device.type == "cuda"),
         )
 
-        threshold_info = tune_binary_threshold(
-            val_true,
-            val_probs[:, 1],
-        )
-
-        val_pred = (val_probs[:, 1] >= threshold_info["threshold"]).astype(np.int64)
+        threshold_info = tune_binary_threshold(val_true, val_probs[:, 1])
         val_f1 = threshold_info["f1"]
         val_acc = threshold_info["acc"]
+        scheduler.step(val_f1)
 
         print(
             f"Epoch {epoch:02d} | "
@@ -581,34 +401,14 @@ def main():
 
     model.load_state_dict(best_state)
 
-    test_loss, test_probs, test_true = eval_epoch(
-        model,
-        te_loader,
-        device,
-        criterion,
-        amp=(args.amp and device.type == "cuda"),
-    )
-
+    test_loss, test_probs, test_true = eval_epoch(model, test_loader, device, criterion)
     test_pred = (test_probs[:, 1] >= best_threshold).astype(np.int64)
 
     test_acc = accuracy_score(test_true, test_pred)
-
-    test_f1_macro = f1_score(
-        test_true,
-        test_pred,
-        average="macro",
-        zero_division=0,
-    )
-
-    test_auroc = roc_auc_score(
-        test_true,
-        test_probs[:, 1],
-    )
-
-    test_auprc = average_precision_score(
-        test_true,
-        test_probs[:, 1],
-    )
+    test_f1_macro = f1_score(test_true, test_pred, average="macro", zero_division=0)
+    test_f1_weighted = f1_score(test_true, test_pred, average="weighted", zero_division=0)
+    test_auroc = roc_auc_score(test_true, test_probs[:, 1])
+    test_auprc = average_precision_score(test_true, test_probs[:, 1])
 
     report = classification_report(
         test_true,
@@ -617,16 +417,15 @@ def main():
         output_dict=True,
         zero_division=0,
     )
-
     cm = confusion_matrix(test_true, test_pred).tolist()
 
     stamp = (
-        f"eicu_v1_transformer_binary_"
+        f"mimic3_v12_7_transformer_binary_"
         f"D{args.d_model}_H{args.nhead}_L{args.layers}_FF{args.ff_dim}_"
         f"Fdyn{dyn_dim}_Fstat{static_dim}"
     )
 
-    model_path = os.path.join(OUT_DIR, f"transformer_binary_{stamp}.pt")
+    model_path = os.path.join(OUT_DIR, f"model_{stamp}.pt")
     metrics_path = os.path.join(OUT_DIR, f"metrics_{stamp}.json")
 
     torch.save(
@@ -658,6 +457,7 @@ def main():
         "test_loss": float(test_loss),
         "test_acc": float(test_acc),
         "test_f1_macro": float(test_f1_macro),
+        "test_f1_weighted": float(test_f1_weighted),
         "test_auroc": float(test_auroc),
         "test_auprc": float(test_auprc),
         "classification_report": report,
@@ -684,9 +484,11 @@ def main():
 
     print(f"\nSaved model:   {model_path}")
     print(f"Saved metrics: {metrics_path}")
+
     print(
         f"Test Acc: {test_acc:.4f} | "
         f"F1 macro: {test_f1_macro:.4f} | "
+        f"F1 weighted: {test_f1_weighted:.4f} | "
         f"AUROC: {test_auroc:.4f} | "
         f"AUPRC: {test_auprc:.4f} | "
         f"Test loss: {test_loss:.4f} | "

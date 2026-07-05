@@ -1,25 +1,38 @@
 #!/usr/bin/env python3
 """
-V1_train_eicu_ome_fusion_ordinal_auc.py
----------------------------------------
+V1_train_mimic3_ome_fusion_ordinal_auc.py
+-----------------------------------
 
-OME-Fusion Ordinal Multi-Encoder Fusion for eICU 3-class LOS prediction
-with AUROC/AUPRC reporting.
+OME-Fusion: Ordinal Multi-Encoder Fusion for eICU 3-class LOS prediction.
 
-Architecture:
-    Dynamic 24h ICU sequence encoded in parallel by:
-        1) BiLSTM encoder
-        2) Transformer encoder
-        3) Pure Mamba encoder
+Novel architecture idea:
+    Dynamic 24h ICU sequence is encoded in parallel by:
+        1) BiLSTM encoder          -> recurrent temporal dynamics
+        2) Transformer encoder     -> attention-based temporal interactions
+        3) Pure Mamba encoder      -> state-space temporal modeling
 
-    Static features encoded by:
+    Static features are encoded by:
         4) Static ANN
 
-    Fusion:
-        [BiLSTM + Transformer + Mamba + Static]
-        -> branch attention
+    Then:
+        [LSTM + Transformer + Mamba + Static]
         -> gated fusion
-        -> 2-logit ordinal head
+        -> ordinal 2-logit head
+
+Reads the SAME files as the other eICU scripts:
+
+    /lustre/home/rahas2/mimic_projects/outputs/lstm_data_v12.1_seq
+
+Expected files:
+    X_dyn_train.npy
+    X_dyn_valid.npy
+    X_dyn_test.npy
+    X_static_train.npy
+    X_static_valid.npy
+    X_static_test.npy
+    y_3c_train.npy
+    y_3c_valid.npy
+    y_3c_test.npy
 
 Task:
     3-class ordinal LOS:
@@ -28,22 +41,25 @@ Task:
         2 = LOS > 7 days
 
 Ordinal targets:
-    logit 0 = P(LOS > 3 days)
-    logit 1 = P(LOS > 7 days)
+    class 0 -> [0, 0]
+    class 1 -> [1, 0]
+    class 2 -> [1, 1]
 
-Reads:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_lstm_data_v1
+Ordinal logits:
+    logit 0 -> P(LOS > 3 days)
+    logit 1 -> P(LOS > 7 days)
 
-Expected files:
-    X_dyn_train.npy / valid / test
-    X_static_train.npy / valid / test
-    y_3c_train.npy / valid / test
+Output folder:
+    /lustre/home/rahas2/mimic_projects/outputs/mimic3_ome_fusion_ordinal_auc_models_v1
 
-Outputs:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_ome_fusion_ordinal_auc_models_v1
+Requires:
+    mamba_ssm
 
 Run:
-    python V1_train_eicu_ome_fusion_ordinal_auc.py --workers 0 --batch 128
+    python V1_train_mimic3_ome_fusion_ordinal_auc.py --workers 0 --batch 128
+
+Optional if stable and you want speed:
+    python V1_train_mimic3_ome_fusion_ordinal_auc.py --workers 0 --batch 128 --amp
 """
 
 import os
@@ -76,9 +92,17 @@ except Exception as e:
         f"Original error: {repr(e)}"
     )
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
+
+# ======================================================
+# CONFIG
+# ======================================================
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
 _EICU_RESULTS = os.path.join(_PROJECT_ROOT, "results_eicu")
 DATA_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_data_v1")
 OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_ome_fusion_ordinal_auc_models_v1")
@@ -86,12 +110,20 @@ OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_ome_fusion_ordinal_auc_models_v1")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
+# ======================================================
+# SEED
+# ======================================================
+
 def seed_everything(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
+
+# ======================================================
+# DATASET
+# ======================================================
 
 class DynStaticOrdinalDataset(Dataset):
     def __init__(self, X_dyn, X_static, y_3c):
@@ -129,12 +161,30 @@ def make_loaders(
         persistent_workers=(workers > 0),
     )
 
-    return (
-        DataLoader(DynStaticOrdinalDataset(X_dyn_train, X_static_train, y_train), shuffle=True, **kwargs),
-        DataLoader(DynStaticOrdinalDataset(X_dyn_valid, X_static_valid, y_valid), shuffle=False, **kwargs),
-        DataLoader(DynStaticOrdinalDataset(X_dyn_test, X_static_test, y_test), shuffle=False, **kwargs),
+    train_loader = DataLoader(
+        DynStaticOrdinalDataset(X_dyn_train, X_static_train, y_train),
+        shuffle=True,
+        **kwargs,
     )
 
+    valid_loader = DataLoader(
+        DynStaticOrdinalDataset(X_dyn_valid, X_static_valid, y_valid),
+        shuffle=False,
+        **kwargs,
+    )
+
+    test_loader = DataLoader(
+        DynStaticOrdinalDataset(X_dyn_test, X_static_test, y_test),
+        shuffle=False,
+        **kwargs,
+    )
+
+    return train_loader, valid_loader, test_loader
+
+
+# ======================================================
+# ORDINAL HELPERS
+# ======================================================
 
 def ordinal_targets(y: torch.Tensor) -> torch.Tensor:
     y = y.long()
@@ -162,21 +212,26 @@ def tune_ordinal_thresholds(y_true, prob_gt3, prob_gt7):
         "thr2": 0.5,
     }
 
-    for t1 in np.arange(0.30, 0.86, 0.02):
-        for t2 in np.arange(0.30, 0.91, 0.02):
-            pred = ordinal_probs_to_class(prob_gt3, prob_gt7, float(t1), float(t2))
+    grid1 = np.arange(0.30, 0.86, 0.02)
+    grid2 = np.arange(0.30, 0.91, 0.02)
+
+    for t1 in grid1:
+        for t2 in grid2:
+            pred = ordinal_probs_to_class(prob_gt3, prob_gt7, t1, t2)
             f1 = f1_score(y_true, pred, average="macro", zero_division=0)
 
             if f1 > best["f1"]:
-                best = {
-                    "f1": float(f1),
-                    "acc": float(accuracy_score(y_true, pred)),
-                    "thr1": float(t1),
-                    "thr2": float(t2),
-                }
+                best["f1"] = float(f1)
+                best["acc"] = float(accuracy_score(y_true, pred))
+                best["thr1"] = float(t1)
+                best["thr2"] = float(t2)
 
     return best
 
+
+# ======================================================
+# LOSS
+# ======================================================
 
 class OrdinalBCELoss(nn.Module):
     def __init__(self, pos_weight=None):
@@ -200,6 +255,10 @@ class OrdinalBCELoss(nn.Module):
             reduction="mean",
         )
 
+
+# ======================================================
+# ENCODER BLOCKS
+# ======================================================
 
 class MambaBlock(nn.Module):
     def __init__(
@@ -412,6 +471,10 @@ class PureMambaEncoderBranch(nn.Module):
         return self.out(torch.cat([h_last, h_mean], dim=1))
 
 
+# ======================================================
+# OME-FUSION MODEL
+# ======================================================
+
 class OMEFusionOrdinal(nn.Module):
     """
     Ordinal Multi-Encoder Fusion:
@@ -420,7 +483,7 @@ class OMEFusionOrdinal(nn.Module):
         Mamba branch
         Static ANN branch
 
-    Then branch attention + gated fusion -> ordinal head.
+    Then gated fusion -> ordinal head.
     """
 
     def __init__(
@@ -494,32 +557,24 @@ class OMEFusionOrdinal(nn.Module):
             nn.Sigmoid(),
         )
 
+        # Small learned branch attention over LSTM / Transformer / Mamba.
         self.branch_score = nn.Sequential(
             nn.Linear(branch_dim, branch_dim // 2),
             nn.Tanh(),
             nn.Linear(branch_dim // 2, 1),
         )
 
-        self.head = nn.Sequential(
-            nn.Linear(fusion_dim, 384),
-            nn.GELU(),
-            nn.LayerNorm(384),
-            nn.Dropout(dropout),
-            nn.Linear(384, 192),
-            nn.GELU(),
-            nn.LayerNorm(192),
-            nn.Dropout(dropout),
-            nn.Linear(192, 2),
-        )
+        self.head = build_standard_head(fusion_dim, n_classes=2)  # 2 ordinal logits
 
     def forward(self, x_dyn, x_static):
         h_lstm = self.lstm_branch(x_dyn)
         h_trf = self.transformer_branch(x_dyn)
         h_mamba = self.mamba_branch(x_dyn)
 
-        branches = torch.stack([h_lstm, h_trf, h_mamba], dim=1)
-        scores = self.branch_score(branches).squeeze(-1)
-        weights = torch.softmax(scores, dim=1).unsqueeze(-1)
+        # Branch attention rescales dynamic branches but keeps all branches available.
+        branches = torch.stack([h_lstm, h_trf, h_mamba], dim=1)  # (B,3,D)
+        scores = self.branch_score(branches).squeeze(-1)        # (B,3)
+        weights = torch.softmax(scores, dim=1).unsqueeze(-1)    # (B,3,1)
         branches = branches * weights
 
         h_lstm = branches[:, 0, :]
@@ -533,8 +588,14 @@ class OMEFusionOrdinal(nn.Module):
         fused = self.fusion_ln(fused)
 
         gate = self.fusion_gate(fused)
-        return self.head(fused * gate)
+        fused = fused * gate
 
+        return self.head(fused)
+
+
+# ======================================================
+# TRAIN / EVAL
+# ======================================================
 
 def train_epoch(
     model,
@@ -581,7 +642,7 @@ def train_epoch(
             optimizer.step()
 
         bs = y.size(0)
-        loss_sum += float(loss.detach().cpu().item()) * bs
+        loss_sum += loss.item() * bs
         n += bs
 
     return loss_sum / max(n, 1)
@@ -613,26 +674,30 @@ def eval_epoch(model, loader, device, criterion, amp: bool = False):
         probs = torch.sigmoid(logits)
 
         bs = y.size(0)
-        loss_sum += float(loss.detach().cpu().item()) * bs
+        loss_sum += loss.item() * bs
         n += bs
 
         probs_all.append(probs.detach().cpu().numpy())
         y_all.append(y.detach().cpu().numpy())
 
-    probs_all = np.concatenate(probs_all) if probs_all else np.empty((0, 2))
+    probs_all = np.concatenate(probs_all) if probs_all else np.array([])
     y_all = np.concatenate(y_all) if y_all else np.array([])
 
     return loss_sum / max(n, 1), probs_all, y_all
 
 
+# ======================================================
+# MAIN
+# ======================================================
+
 def main():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
 
     parser.add_argument("--branch_dim", type=int, default=192)
     parser.add_argument("--lstm_hidden", type=int, default=192)
@@ -646,7 +711,7 @@ def main():
     parser.add_argument("--expand", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.15)
 
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
     parser.add_argument("--amp", action="store_true")
 
     args = parser.parse_args()
@@ -743,18 +808,8 @@ def main():
         f"nhead={args.nhead}, d_state={args.d_state}"
     )
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4,
-    )
-
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3,
-    )
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
 
     scaler = torch.cuda.amp.GradScaler(
         enabled=(args.amp and device.type == "cuda")
@@ -796,6 +851,7 @@ def main():
 
         val_f1 = threshold_info["f1"]
         val_acc = threshold_info["acc"]
+
         scheduler.step(val_f1)
 
         print(
@@ -845,8 +901,20 @@ def main():
     )
 
     test_acc = accuracy_score(test_true, test_pred)
-    test_f1_macro = f1_score(test_true, test_pred, average="macro", zero_division=0)
-    test_f1_weighted = f1_score(test_true, test_pred, average="weighted", zero_division=0)
+
+    test_f1_macro = f1_score(
+        test_true,
+        test_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    test_f1_weighted = f1_score(
+        test_true,
+        test_pred,
+        average="weighted",
+        zero_division=0,
+    )
 
     y_test_ord = np.stack(
         [
@@ -876,13 +944,13 @@ def main():
     cm = confusion_matrix(test_true, test_pred).tolist()
 
     stamp = (
-        f"eicu_v1_ome_fusion_ordinal_auc_3class_"
+        f"mimic3_ome_fusion_ordinal_3class_"
         f"B{args.branch_dim}_"
         f"LSTM{args.lstm_layers}_TRF{args.transformer_layers}_MAMBA{args.mamba_layers}_"
         f"Fdyn{dyn_dim}_Fstat{static_dim}"
     )
 
-    model_path = os.path.join(OUT_DIR, f"ome_fusion_ordinal_auc_{stamp}.pt")
+    model_path = os.path.join(OUT_DIR, f"ome_fusion_ordinal_{stamp}.pt")
     metrics_path = os.path.join(OUT_DIR, f"metrics_{stamp}.json")
 
     torch.save(
@@ -953,7 +1021,10 @@ def main():
         "transformer_layers": int(args.transformer_layers),
         "mamba_layers": int(args.mamba_layers),
         "checkpoint_metric": "validation_macro_f1",
-        "ordinal_targets": ["LOS_gt_3_days", "LOS_gt_7_days"],
+        "ordinal_targets": [
+            "LOS_gt_3_days",
+            "LOS_gt_7_days",
+        ],
         "output_dir": OUT_DIR,
     }
 
@@ -962,7 +1033,6 @@ def main():
 
     print(f"\nSaved model:   {model_path}")
     print(f"Saved metrics: {metrics_path}")
-
     print(
         f"Test Acc: {test_acc:.4f} | "
         f"F1 macro: {test_f1_macro:.4f} | "

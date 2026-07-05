@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-V1_train_eicu_lstm_fusion_binary_auc.py
+V1_train_mimic3_lstm_fusion_binary_auc.py
 ---------------------------------------
 
 eICU BiLSTM + Static ANN Fusion Binary LOS training script
@@ -12,7 +12,7 @@ Task:
         1 = LOS > 7 days
 
 Reads:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_lstm_data_v1
+    /lustre/home/rahas2/mimic_projects/outputs/lstm_data_v12.1_seq
 
 Expected files:
     X_dyn_train.npy / valid / test
@@ -20,10 +20,10 @@ Expected files:
     y_bin_train.npy / valid / test
 
 Outputs:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_lstm_fusion_binary_auc_models_v1
+    /lustre/home/rahas2/mimic_projects/outputs/mimic3_lstm_fusion_binary_auc_models_v1
 
 Run:
-    python V1_train_eicu_lstm_fusion_binary_auc.py --workers 0 --batch 128
+    python V1_train_mimic3_lstm_fusion_binary_auc.py --workers 0 --batch 128
 """
 
 import os
@@ -46,9 +46,16 @@ from sklearn.metrics import (
     average_precision_score,
 )
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
 
+# Same original_data/processed_data project root as the data-build pipeline
+# (V12.1_build_script.py etc.) -- this script's own directory sits 6 levels
+# below that root instead of 3.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
 _EICU_RESULTS = os.path.join(_PROJECT_ROOT, "results_eicu")
 DATA_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_data_v1")
 OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_fusion_binary_auc_models_v1")
@@ -133,16 +140,7 @@ class FusionLSTMBinary(nn.Module):
         self.fusion_ln = nn.LayerNorm(fusion_in_dim)
         self.fusion_gate = nn.Linear(fusion_in_dim, fusion_in_dim)
 
-        self.head = nn.Sequential(
-            nn.Linear(fusion_in_dim, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 2),
-        )
+        self.head = build_standard_head(fusion_in_dim, n_classes=2)
 
     def forward(self, x_dyn, x_static):
         out, (hn, _) = self.lstm(x_dyn)
@@ -258,15 +256,15 @@ def eval_epoch(model, loader, device, criterion, amp=False):
 def main():
     ap = argparse.ArgumentParser()
 
-    ap.add_argument("--epochs", type=int, default=40)
-    ap.add_argument("--batch", type=int, default=256)
+    ap.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    ap.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     ap.add_argument("--hidden", type=int, default=384)
     ap.add_argument("--layers", type=int, default=2)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--patience", type=int, default=10)
+    ap.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    ap.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
     ap.add_argument("--workers", type=int, default=2)
     ap.add_argument("--amp", action="store_true")
-    ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
 
     args = ap.parse_args()
 
@@ -321,13 +319,8 @@ def main():
         layers=args.layers,
     ).to(device)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode="max",
-        factor=0.5,
-        patience=3,
-    )
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
 
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
 
@@ -416,7 +409,7 @@ def main():
     cm = confusion_matrix(te_true, te_pred).tolist()
 
     stamp = (
-        f"eicu_v1_lstm_ann_binary_auc_"
+        f"mimic3_v12_1_lstm_ann_binary_auc_"
         f"H{args.hidden}_L{args.layers}_Fdyn{Xd_tr.shape[2]}_Fstat{Xs_tr.shape[1]}"
     )
 

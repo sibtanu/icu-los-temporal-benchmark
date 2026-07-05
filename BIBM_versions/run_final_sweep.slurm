@@ -37,6 +37,7 @@ PARTITION_GPU="gpu"
 GPUS_PER_JOB="1"
 IMPUTER="median"       # knn (slow) | mean | median
 COHORT_FILTER="original"   # MIMIC-III cohort filter: original | strict
+EICU_SAMPLE_PATIENTS="0"   # eICU build patient cap: 0 = FULL cohort; N>0 = quick subsample
 
 # eICU raw data location on Wahab (the directory containing eICU CSV files).
 # Override here if your copy is not at <project_root>/eicu_data
@@ -259,7 +260,7 @@ EICU_DATA_ARG=""
 [[ -n "${EICU_DATA_DIR}" ]] && EICU_DATA_ARG="--data-dir '${EICU_DATA_DIR}'"
 
 EICU_BUILD=$(submit_data_job "sw_ei_build" "06:00:00" "64G" "4" "" \
-    "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V2.1_build_eicu_los_dataset_corrected_leakage.py' ${EICU_DATA_ARG}")
+    "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V2.1_build_eicu_los_dataset_corrected_leakage.py' --sample-patients ${EICU_SAMPLE_PATIENTS} ${EICU_DATA_ARG}")
 
 EICU_IMPUTE=$(submit_data_job "sw_ei_impute" "04:00:00" "32G" "8" "afterok:${EICU_BUILD}" \
     "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V1_impute_eicu_los_dataset.py'")

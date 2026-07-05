@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-V1_train_eicu_patchtst_fusion_ordinal_auc.py
+V1_train_mimic3_patchtst_fusion_ordinal_auc.py
 ----------------------------------------
 
-PatchTST-style Transformer + static ANN fusion model for eICU 3-class ORDINAL LOS prediction with AUROC/AUPRC reporting.
+PatchTST-style Transformer + static ANN fusion model for eICU 3-class ORDINAL LOS prediction with AUROC/AUPRC.
 
 Reads the same tensors as the other eICU scripts:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_lstm_data_v1
+    /lustre/home/rahas2/mimic_projects/outputs/lstm_data_v12.1_seq
 
 Expected files:
     X_dyn_train.npy / valid / test
@@ -34,7 +34,7 @@ Architecture:
     - validation threshold tuning for macro F1
 
 Output folder:
-    /lustre/home/rahas2/mimic_projects/outputs/eicu_patchtst_fusion_ordinal_auc_models_v1
+    /lustre/home/rahas2/mimic_projects/outputs/mimic3_patchtst_fusion_ordinal_auc_models_v1
 
 Note:
     This is PatchTST-style, adapted for short ICU 24-hour sequences.
@@ -54,8 +54,13 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, roc_auc_score, average_precision_score
 
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+from model_common import build_standard_head, build_standard_optimizer, build_standard_scheduler, STANDARD_HPARAMS
+
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+
 _EICU_RESULTS = os.path.join(_PROJECT_ROOT, "results_eicu")
 DATA_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_data_v1")
 OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_patchtst_fusion_ordinal_auc_models_v1")
@@ -201,16 +206,7 @@ class PatchTSTOrdinalFusion(nn.Module):
         fusion_dim = d_model + static_hidden
         self.fusion_ln = nn.LayerNorm(fusion_dim)
         self.fusion_gate = nn.Linear(fusion_dim, fusion_dim)
-        self.head = nn.Sequential(
-            nn.Linear(fusion_dim, 256),
-            nn.GELU(),
-            nn.LayerNorm(256),
-            nn.Dropout(dropout),
-            nn.Linear(256, 128),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(128, 2),
-        )
+        self.head = build_standard_head(fusion_dim, n_classes=2)  # 2 ordinal logits
 
     def make_patches(self, x_dyn):
         # x_dyn: (B,T,F) -> (B,num_patches,patch_len*F)
@@ -266,8 +262,6 @@ def train_epoch(model, loader, device, criterion, optimizer, scheduler=None, sca
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
 
-        if scheduler is not None:
-            scheduler.step()
         bs = y.size(0)
         loss_sum += loss.item() * bs
         n += bs
@@ -299,11 +293,11 @@ def eval_epoch(model, loader, device, criterion, amp=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=40)
-    parser.add_argument("--batch", type=int, default=256)
+    parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
+    parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
+    parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
     parser.add_argument("--patch_len", type=int, default=4)
     parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--d_model", type=int, default=192)
@@ -311,7 +305,7 @@ def main():
     parser.add_argument("--layers", type=int, default=3)
     parser.add_argument("--ff_dim", type=int, default=384)
     parser.add_argument("--dropout", type=float, default=0.15)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
     parser.add_argument("--amp", action="store_true")
     args = parser.parse_args()
 
@@ -370,14 +364,8 @@ def main():
 
     print(f"Patch config: seq_len={seq_len}, patch_len={args.patch_len}, stride={args.stride}, num_patches={model.num_patches}")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
-    total_steps = args.epochs * max(len(tr), 1)
-    warmup_steps = max(1, int(0.05 * total_steps))
-
-    def lr_lambda(step):
-        return float(step + 1) / float(warmup_steps) if step < warmup_steps else 1.0
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    optimizer = build_standard_optimizer(model, lr=args.lr)
+    scheduler = build_standard_scheduler(optimizer)
     scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and device.type == "cuda"))
 
     best_val_f1 = -1.0
@@ -393,6 +381,7 @@ def main():
         threshold_info = tune_ordinal_thresholds(val_true, val_probs[:, 0], val_probs[:, 1])
         val_f1 = threshold_info["f1"]
         val_acc = threshold_info["acc"]
+        scheduler.step(val_f1)
         print(f"Epoch {epoch:02d} | train {train_loss:.4f} | val {val_loss:.4f} | F1 {val_f1:.4f} | Acc {val_acc:.4f} | t=({threshold_info['thr1']:.2f}, {threshold_info['thr2']:.2f})")
 
         if val_f1 > best_val_f1:
@@ -436,8 +425,8 @@ def main():
     report = classification_report(test_true, test_pred, digits=4, output_dict=True, zero_division=0)
     cm = confusion_matrix(test_true, test_pred).tolist()
 
-    stamp = f"eicu_v1_patchtst_ordinal_auc_3class_P{args.patch_len}_S{args.stride}_D{args.d_model}_H{args.nhead}_L{args.layers}_FF{args.ff_dim}_Fdyn{dyn_dim}_Fstat{static_dim}"
-    model_path = os.path.join(OUT_DIR, f"patchtst_ordinal_auc_{stamp}.pt")
+    stamp = f"mimic3_patchtst_ordinal_3class_P{args.patch_len}_S{args.stride}_D{args.d_model}_H{args.nhead}_L{args.layers}_FF{args.ff_dim}_Fdyn{dyn_dim}_Fstat{static_dim}"
+    model_path = os.path.join(OUT_DIR, f"patchtst_ordinal_{stamp}.pt")
     metrics_path = os.path.join(OUT_DIR, f"metrics_{stamp}.json")
 
     torch.save({
@@ -521,7 +510,6 @@ def main():
         f"Best val F1: {best_val_f1:.4f} | "
         f"Thresholds: {best_thresholds}"
     )
-
     print(
         f"Ordinal AUROC: gt3={test_auroc_gt3:.4f}, gt7={test_auroc_gt7:.4f} | "
         f"Ordinal AUPRC: gt3={test_auprc_gt3:.4f}, gt7={test_auprc_gt7:.4f}"
