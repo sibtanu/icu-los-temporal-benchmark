@@ -824,7 +824,7 @@ def process_medication_like(data_dir, filename, ids_set, chunk_size, prefix):
                 continue
             hb = to_hour_bin(ch[offset_col])
         else:
-            # Leakage fix: do not force untimed medication rows into hour 0,
+            # Data leakage prevention: do not force untimed medication rows into hour 0,
             # except admissionDrug, which is admission-only by design.
             if filename != "admissionDrug.csv.gz":
                 logger.warning(f"No offset column found in {filename}; skipping untimed rows to avoid leakage.")
@@ -1120,7 +1120,7 @@ def main():
 
     # Static severity: merge directly into output
     out = add_static_numeric_table(out, data_dir, "apacheApsVar.csv.gz", "apache_aps", ids_set)
-    # Leakage fix: apachePatientResult/apachePredVar contain outcome/prediction-target-adjacent fields.
+    # Data leakage prevention: apachePatientResult/apachePredVar contain outcome/prediction-target-adjacent fields.
     # Keep apacheApsVar only.
     gc.collect()
 
@@ -1172,7 +1172,7 @@ def main():
     merge_block("microLab", process_micro_lab(data_dir, ids_set, args.chunk_size))
 
     # Static diagnoses
-    # Leakage fix: skip diagnosis.csv because rows may be added after the first 24h.
+    # Data leakage prevention: skip diagnosis.csv because rows may be added after the first 24h.
     # Keep admissionDx only because it is admission-time information.
     dx_frames = []
     dx2 = process_diagnosis_like(data_dir, "admissionDx.csv.gz", ids_set, "admitdx")

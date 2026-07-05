@@ -1,0 +1,11 @@
+# Dependencies for the CPU data-preparation stage (build / impute / preprocess
+# and the combine_results.py summaries). No PyTorch or CUDA required -- this
+# environment is intentionally kept separate from requirements-train.txt so the
+# heavy GPU/mamba_ssm stack never has to resolve alongside the plain-CPU tools.
+#
+# Install with:  pip install -r requirements-dataprep.txt
+
+numpy
+pandas
+scikit-learn
+scipy

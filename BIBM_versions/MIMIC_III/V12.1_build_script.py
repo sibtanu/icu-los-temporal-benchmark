@@ -160,11 +160,9 @@ def _read_csv_maybe_gz(path, **kwargs):
     except ValueError:
         return pd.read_csv(path, compression="gzip", **kwargs)
     except FileNotFoundError:
-        # Also try the OPPOSITE extension -- BUGFIX: the old version only
-        # ever appended ".gz" (handles plain-requested/actually-gzipped),
-        # never stripped it (handles gz-requested/actually-plain, which is
-        # the direction that matters when a cluster's MIMIC-III copy is
-        # already fully decompressed). Try both directions explicitly.
+        # Fall back to the opposite extension: try both .csv <-> .csv.gz so
+        # the loader works whether a given MIMIC-III copy is gzipped or has
+        # already been decompressed on the cluster.
         if path.endswith(".csv.gz"):
             alt = path[: -len(".gz")]
         else:
@@ -280,7 +278,7 @@ def main():
     else:
         logger.warning("No GCS ITEMIDs discovered; proceeding without GCS.")
 
-    # 1) Load ICU, Admissions, Patients (safe parsing)  [UNCHANGED from V8, except logger name/paths]
+    # 1) Load ICU, Admissions, Patients (safe parsing)
     icu_raw = pd.read_csv(
         ICUSTAYS_FILE,
         usecols=["ICUSTAY_ID","HADM_ID","INTIME","OUTTIME","FIRST_CAREUNIT"],
@@ -331,7 +329,7 @@ def main():
                    .groupby("HADM_ID", as_index=False).first()
         )
 
-    # Compute ICU LOS labels  [UNCHANGED]
+    # Compute ICU LOS labels
     icustays["LOS_label"] = (icustays["LOS_DAYS"] > 7.0).astype("int8")
     conds = [
         icustays["LOS_DAYS"] <= 3.0,
@@ -340,13 +338,13 @@ def main():
     ]
     icustays["LOS_label_3class"] = np.select(conds, [0,1,2]).astype("int8")
 
-    # Merge SUBJECT + ADMISSION_TYPE onto ICU rows  [UNCHANGED]
+    # Merge SUBJECT + ADMISSION_TYPE onto ICU rows
     icux = icustays.merge(
         admissions[["HADM_ID","SUBJECT_ID","ADMISSION_TYPE"]],
         on="HADM_ID", how="left"
     )
 
-    # === Sampling (optional) ===  [UNCHANGED]
+    # === Sampling (optional) ===
     if SAMPLE_ADMISSIONS is not None:
         n_avail = icux["HADM_ID"].nunique()
         take = min(int(SAMPLE_ADMISSIONS), n_avail)
@@ -356,7 +354,7 @@ def main():
         admissions = admissions[admissions["HADM_ID"].isin(hadm_sample)]
         patients = patients[patients["SUBJECT_ID"].isin(admissions["SUBJECT_ID"].unique())]
 
-    # === SAFE AGE (calendar arithmetic; no timedelta) ===  [UNCHANGED]
+    # === SAFE AGE (calendar arithmetic; no timedelta) ===
     adm_pat = admissions.merge(patients, on="SUBJECT_ID", how="left")
     adm_pat = safe_to_datetime(adm_pat, ["ADMITTIME", "DOB"])
     mask = (
@@ -388,7 +386,7 @@ def main():
     adm_pat = adm_pat[adm_pat["HADM_ID"].astype(int).isin(eligible_hadm_ids)].copy()
     logger.info(f"Cohort after filtering ({args.cohort_filter}): {len(icustays):,} admissions")
 
-    # Normalize GENDER to single letter if needed  [UNCHANGED]
+    # Normalize GENDER to single letter if needed
     if adm_pat["GENDER"].dtype == object:
         adm_pat["GENDER"] = adm_pat["GENDER"].astype(str).str.strip().str.upper()
 
@@ -418,14 +416,10 @@ def main():
     for c in ["ADMISSION_LOCATION", "INSURANCE", "ETHNICITY"]:
         adm_aux[c] = adm_aux[c].astype(str).str.strip().str.upper()
 
-    # 4) Prior ICU count for subject -- BUGFIX: the old version merged
-    # icustays to itself on HADM_ID, so INDEX_INTIME always equaled the row's
-    # own INTIME and "OUTTIME < INDEX_INTIME" was never true (always
-    # comparing a stay's own OUTTIME to its own INTIME) -- PRIOR_ICU_COUNT_SUBJ
-    # was silently always 0/NaN for every row. Fixed by joining on SUBJECT_ID
-    # against the FULL (pre-cohort-filter) ICU stay history, so a subject's
-    # earlier stay still counts even if that earlier admission itself was
-    # later excluded from this cohort (multi-stay / LOS<1 / age<18).
+    # 4) Prior ICU count for subject: count each subject's earlier ICU stays
+    # by joining on SUBJECT_ID against the FULL (pre-cohort-filter) ICU stay
+    # history, so an earlier stay still counts even if that earlier admission
+    # was itself excluded from this cohort (multi-stay / LOS<1 / age<18).
     icu_all = icu_raw.merge(admissions[["HADM_ID", "SUBJECT_ID"]], on="HADM_ID", how="left")
     icu_all = icu_all.dropna(subset=["SUBJECT_ID", "INTIME", "OUTTIME"])
 
@@ -573,7 +567,7 @@ def main():
 
 
 
-    # Maps  [UNCHANGED]
+    # Maps
     icu_map = icux.set_index("ICUSTAY_ID")[["HADM_ID","INTIME"]].to_dict(orient="index")
     hadm_to_intime = icux.set_index("HADM_ID")["INTIME"].to_dict()
 
@@ -1053,7 +1047,7 @@ def main():
     logger.info("Completed adding 24-hour variability features.")
 
     # ============================================================
-    # B) LABEVENTS — hourly mean per lab label  [UNCHANGED]
+    # B) LABEVENTS — hourly mean per lab label
     # ============================================================
     lab_label_map = load_lab_label_map()
     lab_sum_acc = defaultdict(lambda: defaultdict(float))  # wn -> {(hadm, lab_label): sum}
@@ -1171,7 +1165,7 @@ def main():
     logger.info("Completed adding arterial blood gas (ABG) features.")
 
     # ============================================================
-    # C) OUTPUTEVENTS — hourly sums; urine-specific & total  [UNCHANGED]
+    # C) OUTPUTEVENTS — hourly sums; urine-specific & total
     # ============================================================
     output_itemid_to_label = load_output_itemid_map()
     out_sum_acc_total = defaultdict(lambda: defaultdict(float))   # wn -> {(hadm, "total_output_sum"): sum}
@@ -1982,7 +1976,7 @@ def main():
     for w in feature_frames[1:]:
         features = features.merge(w, on="HADM_ID", how="outer")
 
-    # === Merge static + labels ===  [UNCHANGED]
+    # === Merge static + labels ===
     # === Merge static + labels (use static_cols as base to guarantee rows) ===
     final = static_cols.merge(features, on="HADM_ID", how="left")
     final = final.merge(
