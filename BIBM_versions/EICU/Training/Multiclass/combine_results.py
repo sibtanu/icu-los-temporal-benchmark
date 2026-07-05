@@ -46,12 +46,12 @@ def aggregate_metrics(seed_metrics: list, numeric_cols: list, identity_cols: lis
     return agg
 
 MODEL_OUT_DIRS = [
-    "eicu_lstm_fusion_multiclass_auc_models_v1,
-    eicu_hybrid_lstm_mamba_multiclass_auc_models_v1,
-    eicu_ome_fusion_multiclass_auc_models_v1,
-    eicu_patchtst_fusion_multiclass_auc_models_v1,
-    eicu_pure_mamba_multiclass_auc_models_v1,
-    eicu_transformer_fusion_multiclass_auc_models_v1",
+    "eicu_lstm_fusion_multiclass_auc_models_v1",
+    "eicu_hybrid_lstm_mamba_multiclass_auc_models_v1",
+    "eicu_ome_fusion_multiclass_auc_models_v1",
+    "eicu_patchtst_fusion_multiclass_auc_models_v1",
+    "eicu_pure_mamba_multiclass_auc_models_v1",
+    "eicu_transformer_fusion_multiclass_auc_models_v1",
 ]
 
 NUMERIC_COLS = [

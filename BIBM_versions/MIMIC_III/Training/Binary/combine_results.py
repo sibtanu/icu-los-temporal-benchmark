@@ -46,12 +46,12 @@ def aggregate_metrics(seed_metrics: list, numeric_cols: list, identity_cols: lis
     return agg
 
 MODEL_OUT_DIRS = [
-    "mimic3_lstm_fusion_binary_auc_models_v1,
-    mimic3_hybrid_lstm_mamba_binary_auc_models_v1,
-    mimic3_ome_fusion_binary_auc_models_v1,
-    mimic3_patchtst_fusion_binary_auc_models_v1,
-    mimic3_pure_mamba_binary_auc_models_v1,
-    mimic3_transformer_fusion_binary_auc_models_v1",
+    "mimic3_lstm_fusion_binary_auc_models_v1",
+    "mimic3_hybrid_lstm_mamba_binary_auc_models_v1",
+    "mimic3_ome_fusion_binary_auc_models_v1",
+    "mimic3_patchtst_fusion_binary_auc_models_v1",
+    "mimic3_pure_mamba_binary_auc_models_v1",
+    "mimic3_transformer_fusion_binary_auc_models_v1",
 ]
 
 NUMERIC_COLS = [
