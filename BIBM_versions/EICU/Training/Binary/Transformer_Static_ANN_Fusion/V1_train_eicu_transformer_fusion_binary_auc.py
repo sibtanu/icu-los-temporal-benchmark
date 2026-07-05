@@ -71,9 +71,11 @@ from sklearn.metrics import (
 # CONFIG
 # ======================================================
 
-BASE = "/lustre/home/rahas2/mimic_projects/outputs"
-DATA_DIR = f"{BASE}/eicu_lstm_data_v1"
-OUT_DIR = f"{BASE}/eicu_transformer_fusion_binary_auc_models_v1"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+_EICU_RESULTS = os.path.join(_PROJECT_ROOT, "results_eicu")
+DATA_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_data_v1")
+OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_transformer_fusion_binary_auc_models_v1")
 
 os.makedirs(OUT_DIR, exist_ok=True)
 

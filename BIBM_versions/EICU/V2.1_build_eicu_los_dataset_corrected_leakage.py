@@ -73,8 +73,10 @@ import pandas as pd
 # CONFIG
 # ======================================================
 
-DEFAULT_DATA_DIR = "/lustre/home/rahas2/mimic_projects/eicu_data"
-DEFAULT_OUTPUT_DIR = "/lustre/home/rahas2/mimic_projects/outputs"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+DEFAULT_DATA_DIR = os.path.join(_PROJECT_ROOT, "eicu_data")
+DEFAULT_OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "results_eicu")
 WINDOW_MINUTES = 24 * 60
 SEED = 42
 

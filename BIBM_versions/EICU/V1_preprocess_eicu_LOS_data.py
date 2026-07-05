@@ -35,10 +35,11 @@ import pandas as pd
 from sklearn.model_selection import train_test_split
 
 
-BASE_DIR = "/lustre/home/rahas2/mimic_projects/outputs"
-INPUT_CSV = f"{BASE_DIR}/eicu_los_timewindows_wide_v1_imputed.csv"
-OUTPUT_DIR = f"{BASE_DIR}/eicu_lstm_data_v1"
-PATIENT_CSV = "/lustre/home/rahas2/mimic_projects/eicu_data/patient.csv.gz"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+INPUT_CSV = os.path.join(_PROJECT_ROOT, "results_eicu", "eicu_los_timewindows_wide_v1_imputed.csv")
+OUTPUT_DIR = os.path.join(_PROJECT_ROOT, "results_eicu", "eicu_lstm_data_v1")
+PATIENT_CSV = os.path.join(_PROJECT_ROOT, "eicu_data", "patient.csv.gz")
 
 DEFAULT_SEED = 42
 

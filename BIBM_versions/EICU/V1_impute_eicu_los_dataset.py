@@ -26,9 +26,11 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 
-INPUT_CSV = "/lustre/home/rahas2/mimic_projects/outputs/eicu_los_timewindows_wide_v1.csv"
-OUTPUT_CSV = "/lustre/home/rahas2/mimic_projects/outputs/eicu_los_timewindows_wide_v1_imputed.csv"
-PATIENT_CSV = "/lustre/home/rahas2/mimic_projects/eicu_data/patient.csv.gz"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
+INPUT_CSV = os.path.join(_PROJECT_ROOT, "results_eicu", "eicu_los_timewindows_wide_v1.csv")
+OUTPUT_CSV = os.path.join(_PROJECT_ROOT, "results_eicu", "eicu_los_timewindows_wide_v1_imputed.csv")
+PATIENT_CSV = os.path.join(_PROJECT_ROOT, "eicu_data", "patient.csv.gz")
 
 SPARSE_DROP_THRESHOLD = 0.99
 HOUR_RE = re.compile(r"_(\d+)_(\d+)h$")

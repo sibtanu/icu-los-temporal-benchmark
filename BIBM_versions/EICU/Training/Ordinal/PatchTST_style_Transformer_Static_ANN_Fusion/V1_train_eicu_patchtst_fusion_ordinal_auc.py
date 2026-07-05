@@ -54,9 +54,11 @@ from torch.utils.data import Dataset, DataLoader
 
 from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, roc_auc_score, average_precision_score
 
-BASE = "/lustre/home/rahas2/mimic_projects/outputs"
-DATA_DIR = f"{BASE}/eicu_lstm_data_v1"
-OUT_DIR = f"{BASE}/eicu_patchtst_fusion_ordinal_auc_models_v1"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJECT_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..", "..", ".."))
+_EICU_RESULTS = os.path.join(_PROJECT_ROOT, "results_eicu")
+DATA_DIR = os.path.join(_EICU_RESULTS, "eicu_lstm_data_v1")
+OUT_DIR = os.path.join(_EICU_RESULTS, "eicu_patchtst_fusion_ordinal_auc_models_v1")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
