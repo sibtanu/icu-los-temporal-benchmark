@@ -359,6 +359,14 @@ def main():
     te_auroc_gt7 = roc_auc_score(y_te_ord[:, 1], te_probs[:, 1])
     te_auprc_gt3 = average_precision_score(y_te_ord[:, 0], te_probs[:, 0])
     te_auprc_gt7 = average_precision_score(y_te_ord[:, 1], te_probs[:, 1])
+    # Reconstruct 3-class probabilities from cumulative logits for weighted AUROC/AUPRC
+    _p_gt3, _p_gt7 = te_probs[:, 0], te_probs[:, 1]
+    _p3 = np.column_stack([1 - _p_gt3, np.clip(_p_gt3 - _p_gt7, 0, 1), _p_gt7])
+    _p3 = _p3 / _p3.sum(axis=1, keepdims=True)
+    te_auroc_weighted = roc_auc_score(te_true, _p3, multi_class="ovr", average="weighted")
+    te_auprc_weighted = average_precision_score(
+        np.eye(3)[te_true.astype(int)], _p3, average="weighted"
+    )
 
     rep = classification_report(te_true, te_pred, digits=4, output_dict=True, zero_division=0)
     cm = confusion_matrix(te_true, te_pred).tolist()
@@ -388,6 +396,8 @@ def main():
             "test_auroc_gt7": float(te_auroc_gt7),
             "test_auprc_gt3": float(te_auprc_gt3),
             "test_auprc_gt7": float(te_auprc_gt7),
+        "test_auroc_weighted": float(te_auroc_weighted),
+        "test_auprc_weighted": float(te_auprc_weighted),
         },
         model_path,
     )
@@ -406,6 +416,8 @@ def main():
         "test_auroc_gt7": float(te_auroc_gt7),
         "test_auprc_gt3": float(te_auprc_gt3),
         "test_auprc_gt7": float(te_auprc_gt7),
+        "test_auroc_weighted": float(te_auroc_weighted),
+        "test_auprc_weighted": float(te_auprc_weighted),
         "classification_report": rep,
         "confusion_matrix": cm,
         "best_epoch": int(best_epoch),

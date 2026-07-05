@@ -579,6 +579,14 @@ def main():
 
     test_auprc_gt3 = average_precision_score(y_test_ord[:, 0], test_probs[:, 0])
     test_auprc_gt7 = average_precision_score(y_test_ord[:, 1], test_probs[:, 1])
+    # Reconstruct 3-class probabilities from cumulative logits for weighted AUROC/AUPRC
+    _p_gt3, _p_gt7 = test_probs[:, 0], test_probs[:, 1]
+    _p3 = np.column_stack([1 - _p_gt3, np.clip(_p_gt3 - _p_gt7, 0, 1), _p_gt7])
+    _p3 = _p3 / _p3.sum(axis=1, keepdims=True)
+    test_auroc_weighted = roc_auc_score(test_true, _p3, multi_class="ovr", average="weighted")
+    test_auprc_weighted = average_precision_score(
+        np.eye(3)[test_true.astype(int)], _p3, average="weighted"
+    )
 
     report = classification_report(
         test_true,
@@ -622,6 +630,8 @@ def main():
             "test_auroc_gt7": float(test_auroc_gt7),
             "test_auprc_gt3": float(test_auprc_gt3),
             "test_auprc_gt7": float(test_auprc_gt7),
+            "test_auroc_weighted": float(test_auroc_weighted),
+            "test_auprc_weighted": float(test_auprc_weighted),
         },
         model_path,
     )
@@ -640,6 +650,8 @@ def main():
         "test_auroc_gt7": float(test_auroc_gt7),
         "test_auprc_gt3": float(test_auprc_gt3),
         "test_auprc_gt7": float(test_auprc_gt7),
+            "test_auroc_weighted": float(test_auroc_weighted),
+            "test_auprc_weighted": float(test_auprc_weighted),
         "classification_report": report,
         "confusion_matrix": cm,
         "best_epoch": int(best_epoch),

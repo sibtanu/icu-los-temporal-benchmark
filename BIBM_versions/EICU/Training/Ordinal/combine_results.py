@@ -64,6 +64,8 @@ NUMERIC_COLS = [
     "test_auroc_gt7",
     "test_auprc_gt3",
     "test_auprc_gt7",
+    "test_auroc_weighted",
+    "test_auprc_weighted",
     "best_epoch",
     "elapsed_sec",
 ]

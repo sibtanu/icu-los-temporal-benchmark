@@ -55,7 +55,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 MIMIC_RESULTS_BIN="${PROJECT_ROOT}/results_LOS_dynamic"
 MIMIC_RESULTS_ORD="${PROJECT_ROOT}/results_LOS_dynamic"
-MIMIC_RESULTS_MC="${PROJECT_ROOT}/results_timeseries"
+MIMIC_RESULTS_MC="${PROJECT_ROOT}/results_LOS_dynamic"
 EICU_RESULTS="${PROJECT_ROOT}/results_eicu"
 
 LOG_DIR="${SCRIPT_DIR}/logs_sweep"

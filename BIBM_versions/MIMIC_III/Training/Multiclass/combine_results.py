@@ -85,7 +85,7 @@ def main():
         "--results_dir",
         default=os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            "..", "..", "..", "..", "..", "results_timeseries",
+            "..", "..", "..", "..", "..", "results_LOS_dynamic",
         ),
     )
     ap.add_argument("--out_csv", default=None)
