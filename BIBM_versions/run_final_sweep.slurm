@@ -135,10 +135,18 @@ declare -a EICU_MC_SCRIPTS=(
     "V1_train_eicu_transformer_fusion_multiclass_auc.py"
 )
 
-# Per-model extra args: all empty = true apples-to-apples comparison.
-# Add overrides here if a specific model needs them, e.g.:
-#   EXTRA_ARGS[4]="--lr 3e-4 --grad_clip 0.5"
-declare -a EXTRA_ARGS=("" "" "" "" "" "")
+# Per-model extra args — disclosed exceptions to STANDARD_HPARAMS.
+# Models [1]=Hybrid and [4]=Pure-Mamba contain Mamba SSM layers that diverge
+# (NaN probabilities) under lr=1e-3; confirmed stable at lr=3e-4 + grad_clip=0.5.
+# Reported as an architecture finding, not silently normalized away.
+declare -a EXTRA_ARGS=(
+  ""
+  "--lr 3e-4 --grad_clip 0.5"
+  ""
+  ""
+  "--lr 3e-4 --grad_clip 0.5"
+  ""
+)
 
 # ==============================================================================
 # Pre-flight: verify ALL scripts exist before submitting a single job
