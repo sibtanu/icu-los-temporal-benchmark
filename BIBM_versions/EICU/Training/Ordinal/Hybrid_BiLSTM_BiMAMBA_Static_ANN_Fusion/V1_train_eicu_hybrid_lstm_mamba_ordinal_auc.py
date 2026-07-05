@@ -295,6 +295,7 @@ class HybridDynEncoder(nn.Module):
             dropout=0.3,
         )
 
+        self.in_norm = nn.LayerNorm(f_dyn)
         self.mamba = BiMamba(
             f_dyn,
             d_model=mamba_dim,
@@ -303,6 +304,7 @@ class HybridDynEncoder(nn.Module):
         )
 
     def forward(self, x):
+        x = self.in_norm(x)
         out, (hn, _) = self.lstm(x)
 
         h_lstm = torch.cat(
@@ -407,6 +409,8 @@ def run_epoch(
         n += bs
 
         if not training:
+            if not torch.isfinite(logits).all():
+                raise RuntimeError("Eval produced NaN/Inf logits.")
             probs_all.append(torch.sigmoid(logits).detach().cpu().numpy())
             y_all.append(y.detach().cpu().numpy())
 

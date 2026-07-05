@@ -137,18 +137,12 @@ declare -a EICU_MC_SCRIPTS=(
     "V1_train_eicu_transformer_fusion_multiclass_auc.py"
 )
 
-# Per-model extra args — disclosed exceptions to STANDARD_HPARAMS.
-# Models [1]=Hybrid and [4]=Pure-Mamba contain Mamba SSM layers that diverge
-# (NaN probabilities) under lr=1e-3; confirmed stable at lr=3e-4 + grad_clip=0.5.
-# Reported as an architecture finding, not silently normalized away.
-declare -a EXTRA_ARGS=(
-  ""
-  "--lr 3e-4 --grad_clip 0.5"
-  ""
-  ""
-  "--lr 3e-4 --grad_clip 0.5"
-  ""
-)
+# Per-model extra args — all empty: every model runs at the shared
+# STANDARD_HPARAMS (lr=1e-3) for a true apples-to-apples comparison.
+# The two Mamba-based models (Hybrid, Pure-Mamba) are stabilized
+# architecturally (input LayerNorm on the dynamic features) rather than via
+# a per-model learning-rate override, so no exceptions are needed here.
+declare -a EXTRA_ARGS=("" "" "" "" "" "")
 
 # ==============================================================================
 # Pre-flight: verify ALL scripts exist before submitting a single job
