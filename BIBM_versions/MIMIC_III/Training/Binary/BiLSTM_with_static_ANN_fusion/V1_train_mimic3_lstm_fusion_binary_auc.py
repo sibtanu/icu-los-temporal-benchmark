@@ -263,12 +263,13 @@ def main():
     ap.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
     ap.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
     ap.add_argument("--workers", type=int, default=2)
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--amp", action="store_true")
     ap.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
 
     args = ap.parse_args()
 
-    seed_everything(42)
+    seed_everything(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -410,7 +411,7 @@ def main():
 
     stamp = (
         f"mimic3_v12_1_lstm_ann_binary_auc_"
-        f"H{args.hidden}_L{args.layers}_Fdyn{Xd_tr.shape[2]}_Fstat{Xs_tr.shape[1]}"
+        f"H{args.hidden}_L{args.layers}_Fdyn{Xd_tr.shape[2]}_Fstat{Xs_tr.shape[1]}_seed{args.seed}"
     )
 
     model_path = os.path.join(OUT_DIR, f"lstm_ann_binary_auc_{stamp}.pt")

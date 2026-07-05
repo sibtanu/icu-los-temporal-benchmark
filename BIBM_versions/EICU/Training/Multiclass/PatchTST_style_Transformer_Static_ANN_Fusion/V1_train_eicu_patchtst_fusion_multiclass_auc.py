@@ -230,6 +230,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
     parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
     parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
@@ -244,7 +245,7 @@ def main():
     parser.add_argument("--amp", action="store_true")
     args = parser.parse_args()
 
-    seed_everything(42)
+    seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("USING eICU PATCHTST-STYLE TRANSFORMER + ANN FUSION MULTICLASS (3-CLASS SOFTMAX) WITH AUROC/AUPRC")
@@ -339,7 +340,7 @@ def main():
     report = classification_report(test_true, test_pred, digits=4, output_dict=True, zero_division=0)
     cm = confusion_matrix(test_true, test_pred).tolist()
 
-    stamp = f"eicu_patchtst_multiclass_P{args.patch_len}_S{args.stride}_D{args.d_model}_H{args.nhead}_L{args.layers}_FF{args.ff_dim}_Fdyn{dyn_dim}_Fstat{static_dim}"
+    stamp = f"eicu_patchtst_multiclass_P{args.patch_len}_S{args.stride}_D{args.d_model}_H{args.nhead}_L{args.layers}_FF{args.ff_dim}_Fdyn{dyn_dim}_Fstat{static_dim}_seed{args.seed}"
     model_path = os.path.join(OUT_DIR, f"patchtst_multiclass_{stamp}.pt")
     metrics_path = os.path.join(OUT_DIR, f"metrics_{stamp}.json")
 

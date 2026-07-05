@@ -211,12 +211,13 @@ def main():
     parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
     parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
     parser.add_argument("--amp", action="store_true")
     args = parser.parse_args()
 
-    seed_everything(42)
+    seed_everything(args.seed)
     assert torch.cuda.is_available(), "CUDA not available"
     device = torch.device("cuda")
 
@@ -297,7 +298,7 @@ def main():
     rep = classification_report(te_true, te_pred, digits=4, output_dict=True, zero_division=0)
     cm = confusion_matrix(te_true, te_pred).tolist()
 
-    stamp = f"eicu_hybrid_lstm_mamba_multiclass_ep{best_epoch}_Fdyn{Xd_tr.shape[2]}_Fstat{Xs_tr.shape[1]}"
+    stamp = f"eicu_hybrid_lstm_mamba_multiclass_ep{best_epoch}_Fdyn{Xd_tr.shape[2]}_Fstat{Xs_tr.shape[1]}_seed{args.seed}"
     model_path = os.path.join(OUT_DIR, f"hybrid_multiclass_{stamp}.pt")
     metrics_path = os.path.join(OUT_DIR, f"metrics_{stamp}.json")
 

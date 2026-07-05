@@ -2,17 +2,19 @@
 """
 combine_results.py
 -------------------
-Gathers the latest metrics_*.json from each of the 6 ordinal model
-output directories and writes a single summary CSV.
+Collects metrics from multiple seed runs for each of the 6 MIMIC-III
+ordinal model output directories and writes a summary CSV with
+mean ± std across seeds.
 
-Run after all 6 V1_train_mimic3_*_ordinal_auc.py jobs have finished:
-    python combine_results.py --results_dir <results_LOS_dynamic>
+Run after all seed training jobs have finished:
+    python combine_results.py --results_dir <results_LOS_dynamic> [--n_seeds 5]
 """
 
 import os
 import csv
 import glob
 import json
+import math
 import argparse
 
 MODEL_OUT_DIRS = [
@@ -24,10 +26,7 @@ MODEL_OUT_DIRS = [
     "mimic3_transformer_fusion_ordinal_auc_models_v1",
 ]
 
-CSV_COLUMNS = [
-    "model",
-    "dataset",
-    "label",
+NUMERIC_COLS = [
     "test_acc",
     "test_f1_macro",
     "test_f1_weighted",
@@ -39,15 +38,45 @@ CSV_COLUMNS = [
     "test_auprc_gt7",
     "best_epoch",
     "elapsed_sec",
-    "metrics_path",
 ]
 
+IDENTITY_COLS = ["model", "dataset", "label"]
+CSV_COLUMNS = (
+    IDENTITY_COLS
+    + ["n_seeds"]
+    + [f"{c}_mean" for c in NUMERIC_COLS]
+    + [f"{c}_std" for c in NUMERIC_COLS]
+    + ["metrics_files"]
+)
 
-def latest_metrics_json(folder: str):
+
+def collect_seed_jsons(folder: str, n_seeds: int):
     files = glob.glob(os.path.join(folder, "metrics_*.json"))
     if not files:
-        return None
-    return max(files, key=os.path.getmtime)
+        return []
+    return sorted(files, key=os.path.getmtime)[-n_seeds:]
+
+
+def _mean_std(values):
+    n = len(values)
+    if n == 0:
+        return float("nan"), float("nan")
+    m = sum(values) / n
+    if n == 1:
+        return m, 0.0
+    return m, math.sqrt(sum((v - m) ** 2 for v in values) / (n - 1))
+
+
+def aggregate_metrics(seed_metrics: list) -> dict:
+    first = seed_metrics[0]
+    agg = {col: first.get(col, "") for col in IDENTITY_COLS}
+    agg["n_seeds"] = len(seed_metrics)
+    for col in NUMERIC_COLS:
+        vals = [float(m[col]) for m in seed_metrics if isinstance(m.get(col), (int, float))]
+        mv, sv = _mean_std(vals)
+        agg[f"{col}_mean"] = "" if math.isnan(mv) else round(mv, 6)
+        agg[f"{col}_std"] = "" if math.isnan(sv) else round(sv, 6)
+    return agg
 
 
 def main():
@@ -55,66 +84,49 @@ def main():
     ap.add_argument(
         "--results_dir",
         default=os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "..", "..",
-            "results_LOS_dynamic",
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", "..", "..", "..", "results_LOS_dynamic",
         ),
-        help="Parent directory containing each model's *_ordinal_auc_models_v1 output folder.",
     )
-    ap.add_argument(
-        "--out_csv",
-        default=None,
-        help="Where to write the summary CSV (defaults to <results_dir>/ordinal_summary.csv).",
-    )
+    ap.add_argument("--out_csv", default=None)
+    ap.add_argument("--n_seeds", type=int, default=5,
+                    help="Number of most-recent seed runs to aggregate per model.")
     args = ap.parse_args()
 
     results_dir = os.path.abspath(args.results_dir)
     out_csv = args.out_csv or os.path.join(results_dir, "ordinal_summary.csv")
 
-    rows = []
-    missing = []
+    rows, missing = [], []
 
     for model_dir_name in MODEL_OUT_DIRS:
         folder = os.path.join(results_dir, model_dir_name)
-        metrics_path = latest_metrics_json(folder)
-
-        if metrics_path is None:
+        json_files = collect_seed_jsons(folder, args.n_seeds)
+        if not json_files:
             missing.append(model_dir_name)
             continue
-
-        with open(metrics_path, "r") as f:
-            m = json.load(f)
-
-        row = {col: m.get(col, "") for col in CSV_COLUMNS}
-        row["metrics_path"] = metrics_path
+        seed_metrics = [json.load(open(jf)) for jf in json_files]
+        row = aggregate_metrics(seed_metrics)
+        row["metrics_files"] = "|".join(os.path.basename(jf) for jf in json_files)
         rows.append(row)
 
     if not rows:
-        raise RuntimeError(
-            f"No metrics_*.json found under any of the expected output folders in {results_dir}. "
-            "Did the training jobs finish?"
-        )
+        raise RuntimeError(f"No metrics_*.json found in {results_dir}.")
 
-    os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+    os.makedirs(os.path.dirname(out_csv) or ".", exist_ok=True)
     with open(out_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
+        csv.DictWriter(f, fieldnames=CSV_COLUMNS).writeheader()
         for row in rows:
-            writer.writerow(row)
+            csv.DictWriter(f, fieldnames=CSV_COLUMNS).writerow(row)
 
-    print(f"[INFO] Wrote {len(rows)} model rows to {out_csv}")
+    n_s = rows[0]["n_seeds"] if rows else 0
+    print(f"[INFO] Wrote {len(rows)} models ({n_s} seeds each) to {out_csv}")
     if missing:
         print(f"[WARN] No metrics found for: {missing}")
-
-    print("\nSummary (acc / f1_macro / auroc_macro):")
+    print("\nSummary (f1_macro mean ± std):")
     for row in rows:
-        print(
-            f"  {row['model']:60s} | "
-            f"acc={row['test_acc']:.4f} | "
-            f"f1_macro={row['test_f1_macro']:.4f} | "
-            f"auroc_macro={row['test_auroc_macro']:.4f}"
-            if isinstance(row["test_acc"], float)
-            else f"  {row['model']:60s} | (non-numeric metrics, check {row['metrics_path']})"
-        )
+        m, s = row.get("test_f1_macro_mean", ""), row.get("test_f1_macro_std", "")
+        val = f"{m:.4f} ± {s:.4f}" if isinstance(m, float) else "(no data)"
+        print(f"  {row['model']:60s} | f1_macro = {val}")
 
 
 if __name__ == "__main__":

@@ -239,6 +239,7 @@ def main():
     parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
     parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
     parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--grad_clip", type=float, default=STANDARD_HPARAMS["grad_clip"])
     parser.add_argument("--amp", action="store_true")
@@ -247,7 +248,7 @@ def main():
 
     args = parser.parse_args()
 
-    seed_everything(42)
+    seed_everything(args.seed)
 
     assert torch.cuda.is_available(), "CUDA not available"
     device = torch.device("cuda")
@@ -407,7 +408,7 @@ def main():
     stamp = (
         f"mimic3_pure_mamba_binary_"
         f"ep{best_epoch}_D{args.d_model}_L{args.layers}_"
-        f"Fdyn{Xd_tr.shape[2]}_Fstat{Xs_tr.shape[1]}"
+        f"Fdyn{Xd_tr.shape[2]}_Fstat{Xs_tr.shape[1]}_seed{args.seed}"
     )
 
     model_path = os.path.join(OUT_DIR, f"pure_mamba_binary_{stamp}.pt")

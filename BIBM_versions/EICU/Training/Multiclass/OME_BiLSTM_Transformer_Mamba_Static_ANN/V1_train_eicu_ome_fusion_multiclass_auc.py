@@ -364,6 +364,7 @@ def main():
 
     parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
     parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
     parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
@@ -385,7 +386,7 @@ def main():
 
     args = parser.parse_args()
 
-    seed_everything(42)
+    seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("USING eICU OME-FUSION MULTICLASS (3-CLASS SOFTMAX) WITH AUROC/AUPRC")
@@ -493,7 +494,7 @@ def main():
     stamp = (
         f"eicu_ome_fusion_multiclass_"
         f"B{args.branch_dim}_LSTM{args.lstm_layers}_TRF{args.transformer_layers}_MAMBA{args.mamba_layers}_"
-        f"Fdyn{dyn_dim}_Fstat{static_dim}"
+        f"Fdyn{dyn_dim}_Fstat{static_dim}_seed{args.seed}"
     )
 
     model_path = os.path.join(OUT_DIR, f"ome_fusion_multiclass_{stamp}.pt")

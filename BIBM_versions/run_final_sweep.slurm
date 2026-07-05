@@ -38,6 +38,8 @@ GPUS_PER_JOB="1"
 IMPUTER="median"       # knn (slow) | mean | median
 COHORT_FILTER="original"   # MIMIC-III cohort filter: original | strict
 EICU_SAMPLE_PATIENTS="0"   # eICU build patient cap: 0 = FULL cohort; N>0 = quick subsample
+SEEDS=(42 43 44 45 46)     # seeds for multi-seed runs; mean±std reported in summary CSVs
+SKIP_BUILD="false"         # set to "true" to skip data pipelines (tensors already built)
 
 # eICU raw data location on Wahab (the directory containing eICU CSV files).
 # Override here if your copy is not at <project_root>/eicu_data
@@ -209,20 +211,28 @@ submit_data_job () {
 }
 
 # submit_train_job <job_name> <script_path> <dep_id> <extra_args>
+# Submits a Slurm job array (one task per seed).  SLURM_ARRAY_TASK_ID maps to
+# SEEDS[0..N-1]: seed = SEEDS[0] + task_id (works for consecutive seeds 42-46).
+# Returns the job ID (shared across all array tasks).
 submit_train_job () {
     local name=$1 script=$2 dep=$3 extra=$4
+    local n_seeds=${#SEEDS[@]}
+    local seed_base=${SEEDS[0]}
+    local dep_flags=()
+    [[ "${dep}" != "none" ]] && dep_flags=(--dependency=afterok:"${dep}")
     sbatch --parsable \
            "${ACCOUNT_ARGS[@]}" \
            --partition="${PARTITION_GPU}" \
            --gres=gpu:"${GPUS_PER_JOB}" \
-           --dependency=afterok:"${dep}" \
+           "${dep_flags[@]}" \
+           --array=0-$((n_seeds - 1)) \
            --job-name="${name}" \
-           --output="${LOG_DIR}/output/${name}_%j.log" \
-           --error="${LOG_DIR}/error/${name}_%j.log" \
+           --output="${LOG_DIR}/output/${name}_%A_%a.log" \
+           --error="${LOG_DIR}/error/${name}_%A_%a.log" \
            --cpus-per-task=4 \
            --mem=32G \
            --time=06:00:00 \
-           --wrap="${ENV_SETUP} ${PYRUN_TRAIN} '${script}' --workers 4 ${extra}"
+           --wrap="${ENV_SETUP} ${PYRUN_TRAIN} '${script}' --workers 4 --seed \$((${seed_base} + SLURM_ARRAY_TASK_ID)) ${extra}"
 }
 
 # submit_combine_job <job_name> <dep_list_colon> <combine_script> <results_dir> <out_csv>
@@ -238,45 +248,50 @@ submit_combine_job () {
            --cpus-per-task=1 \
            --mem=4G \
            --time=00:15:00 \
-           --wrap="${ENV_SETUP} ${PYRUN_DATAPREP} '${script}' --results_dir '${results_dir}' --out_csv '${results_dir}/${out_csv}'"
+           --wrap="${ENV_SETUP} ${PYRUN_DATAPREP} '${script}' --results_dir '${results_dir}' --out_csv '${results_dir}/${out_csv}' --n_seeds ${#SEEDS[@]}"
 }
 
 # ==============================================================================
-# Stage 0a: MIMIC-III data pipeline
+# Stage 0a/0b: data pipelines — skipped when SKIP_BUILD=true
+# (tensors already in processed_data/ and results_eicu/ from a previous run)
 # ==============================================================================
-echo ""
-echo "[STAGE 0a] Submitting MIMIC-III data pipeline (cohort_filter=${COHORT_FILTER})..."
+MIMIC_PREP="none"
+EICU_PREP="none"
 
-MIMIC_BUILD=$(submit_data_job "sw_mb_build" "08:00:00" "64G" "4" "" \
-    "${ENV_SETUP} ${PYRUN_DATAPREP} '${MIMIC_DIR}/V12.1_build_script.py' --cohort_filter ${COHORT_FILTER}")
+if [[ "${SKIP_BUILD}" == "false" ]]; then
+  echo ""
+  echo "[STAGE 0a] Submitting MIMIC-III data pipeline (cohort_filter=${COHORT_FILTER})..."
 
-MIMIC_IMPUTE=$(submit_data_job "sw_mb_impute" "04:00:00" "32G" "8" "afterok:${MIMIC_BUILD}" \
-    "${ENV_SETUP} ${PYRUN_DATAPREP} '${MIMIC_DIR}/V12.1_impute_script.py' --imputer ${IMPUTER}")
+  MIMIC_BUILD=$(submit_data_job "sw_mb_build" "08:00:00" "64G" "4" "" \
+      "${ENV_SETUP} ${PYRUN_DATAPREP} '${MIMIC_DIR}/V12.1_build_script.py' --cohort_filter ${COHORT_FILTER}")
 
-MIMIC_PREP=$(submit_data_job "sw_mb_prep" "01:30:00" "32G" "4" "afterok:${MIMIC_IMPUTE}" \
-    "${ENV_SETUP} ${PYRUN_DATAPREP} '${MIMIC_DIR}/V12.1_preprocess_script.py'")
+  MIMIC_IMPUTE=$(submit_data_job "sw_mb_impute" "04:00:00" "32G" "8" "afterok:${MIMIC_BUILD}" \
+      "${ENV_SETUP} ${PYRUN_DATAPREP} '${MIMIC_DIR}/V12.1_impute_script.py' --imputer ${IMPUTER}")
 
-echo "  build=${MIMIC_BUILD} -> impute=${MIMIC_IMPUTE} -> preprocess=${MIMIC_PREP}"
+  MIMIC_PREP=$(submit_data_job "sw_mb_prep" "01:30:00" "32G" "4" "afterok:${MIMIC_IMPUTE}" \
+      "${ENV_SETUP} ${PYRUN_DATAPREP} '${MIMIC_DIR}/V12.1_preprocess_script.py'")
 
-# ==============================================================================
-# Stage 0b: eICU data pipeline (runs in parallel with 0a)
-# ==============================================================================
-echo ""
-echo "[STAGE 0b] Submitting eICU data pipeline..."
+  echo "  build=${MIMIC_BUILD} -> impute=${MIMIC_IMPUTE} -> preprocess=${MIMIC_PREP}"
 
-EICU_DATA_ARG=""
-[[ -n "${EICU_DATA_DIR}" ]] && EICU_DATA_ARG="--data-dir '${EICU_DATA_DIR}'"
+  echo ""
+  echo "[STAGE 0b] Submitting eICU data pipeline..."
 
-EICU_BUILD=$(submit_data_job "sw_ei_build" "06:00:00" "64G" "4" "" \
-    "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V2.1_build_eicu_los_dataset_corrected_leakage.py' --sample-patients ${EICU_SAMPLE_PATIENTS} ${EICU_DATA_ARG}")
+  EICU_DATA_ARG=""
+  [[ -n "${EICU_DATA_DIR}" ]] && EICU_DATA_ARG="--data-dir '${EICU_DATA_DIR}'"
 
-EICU_IMPUTE=$(submit_data_job "sw_ei_impute" "04:00:00" "32G" "8" "afterok:${EICU_BUILD}" \
-    "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V1_impute_eicu_los_dataset.py'")
+  EICU_BUILD=$(submit_data_job "sw_ei_build" "06:00:00" "64G" "4" "" \
+      "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V2.1_build_eicu_los_dataset_corrected_leakage.py' --sample-patients ${EICU_SAMPLE_PATIENTS} ${EICU_DATA_ARG}")
 
-EICU_PREP=$(submit_data_job "sw_ei_prep" "01:30:00" "32G" "4" "afterok:${EICU_IMPUTE}" \
-    "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V1_preprocess_eicu_LOS_data.py'")
+  EICU_IMPUTE=$(submit_data_job "sw_ei_impute" "04:00:00" "32G" "8" "afterok:${EICU_BUILD}" \
+      "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V1_impute_eicu_los_dataset.py'")
 
-echo "  build=${EICU_BUILD} -> impute=${EICU_IMPUTE} -> preprocess=${EICU_PREP}"
+  EICU_PREP=$(submit_data_job "sw_ei_prep" "01:30:00" "32G" "4" "afterok:${EICU_IMPUTE}" \
+      "${ENV_SETUP} ${PYRUN_DATAPREP} '${EICU_DIR}/V1_preprocess_eicu_LOS_data.py'")
+
+  echo "  build=${EICU_BUILD} -> impute=${EICU_IMPUTE} -> preprocess=${EICU_PREP}"
+else
+  echo "[STAGE 0] SKIP_BUILD=true — skipping data pipelines, training starts immediately."
+fi
 
 # ==============================================================================
 # Stage 1: Training — 6 models × 3 tasks × 2 datasets = 36 GPU jobs

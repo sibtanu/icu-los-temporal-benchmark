@@ -225,6 +225,7 @@ def main():
 
     parser.add_argument("--epochs", type=int, default=STANDARD_HPARAMS["max_epochs"])
     parser.add_argument("--batch", type=int, default=STANDARD_HPARAMS["batch_size"])
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=STANDARD_HPARAMS["lr"])
     parser.add_argument("--patience", type=int, default=STANDARD_HPARAMS["patience"])
@@ -237,7 +238,7 @@ def main():
 
     args = parser.parse_args()
 
-    seed_everything(42)
+    seed_everything(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -346,7 +347,7 @@ def main():
     stamp = (
         f"eicu_transformer_multiclass_"
         f"D{args.d_model}_H{args.nhead}_L{args.layers}_FF{args.ff_dim}_"
-        f"Fdyn{dyn_dim}_Fstat{static_dim}"
+        f"Fdyn{dyn_dim}_Fstat{static_dim}_seed{args.seed}"
     )
 
     model_path = os.path.join(OUT_DIR, f"model_{stamp}.pt")
