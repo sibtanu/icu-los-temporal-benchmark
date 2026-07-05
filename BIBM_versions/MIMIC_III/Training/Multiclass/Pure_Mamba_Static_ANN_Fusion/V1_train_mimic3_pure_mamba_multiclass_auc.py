@@ -89,9 +89,15 @@ class RMSNorm(nn.Module):
 
 
 class BiMambaEncoder(nn.Module):
-    def __init__(self, f_dyn, d_model=192, layers=3, d_state=16, d_conv=4, expand=2, resid_scale=0.5):
+    """Bidirectional Mamba: projects input, adds positional embedding, runs N
+    residual Mamba blocks in forward and reversed directions, pools
+    [fwd_last, bwd_last, fwd_mean, bwd_mean] → 4 × d_model.
+    Canonical architecture shared across MIMIC-III and eICU Pure-Mamba scripts."""
+    def __init__(self, f_dyn, d_model=192, seq_len=24, layers=3,
+                 d_state=16, d_conv=4, expand=2, resid_scale=0.5):
         super().__init__()
         self.proj = nn.Linear(f_dyn, d_model)
+        self.pos_embed = nn.Embedding(seq_len, d_model)
         self.blocks = nn.ModuleList([
             Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
             for _ in range(layers)
@@ -101,6 +107,9 @@ class BiMambaEncoder(nn.Module):
 
     def encode(self, x):
         h = self.proj(x)
+        T = h.size(1)
+        pos_ids = torch.arange(T, device=h.device).unsqueeze(0)
+        h = h + self.pos_embed(pos_ids)
         for block in self.blocks:
             h = h + self.resid_scale * block(h)
             h = self.norm(h)
@@ -113,28 +122,35 @@ class BiMambaEncoder(nn.Module):
 
 
 class PureMambaMulticlassModel(nn.Module):
-    def __init__(self, f_dyn, f_static, d_model=192, layers=3):
+    def __init__(self, f_dyn, f_static, seq_len=24, d_model=192, layers=3):
         super().__init__()
-
+        self.dyn_norm = nn.LayerNorm(f_dyn)
+        self.static_norm = nn.LayerNorm(f_static)
         self.dyn = BiMambaEncoder(
-            f_dyn=f_dyn, d_model=d_model, layers=layers,
+            f_dyn=f_dyn, d_model=d_model, seq_len=seq_len, layers=layers,
             d_state=16, d_conv=4, expand=2, resid_scale=0.5,
         )
-
         self.stat = nn.Sequential(
             nn.Linear(f_static, 128),
-            nn.ReLU(),
+            nn.GELU(),
             nn.LayerNorm(128),
+            nn.Dropout(0.2),
             nn.Linear(128, 128),
-            nn.ReLU(),
+            nn.GELU(),
             nn.LayerNorm(128),
         )
-
-        self.head = build_standard_head(4 * d_model + 128, n_classes=N_CLASSES)
+        fusion_dim = 4 * d_model + 128
+        self.fusion_ln = nn.LayerNorm(fusion_dim)
+        self.fusion_gate = nn.Linear(fusion_dim, fusion_dim)
+        self.head = build_standard_head(fusion_dim, n_classes=N_CLASSES)
 
     def forward(self, xd, xs):
-        h = torch.cat([self.dyn(xd), self.stat(xs)], dim=1)
-        return self.head(h)
+        h_dyn = self.dyn(self.dyn_norm(xd))
+        h_stat = self.stat(self.static_norm(xs))
+        fused = torch.cat([h_dyn, h_stat], dim=1)
+        fused = self.fusion_ln(fused)
+        gate = torch.sigmoid(self.fusion_gate(fused))
+        return self.head(fused * gate)
 
 
 def run_epoch(model, loader, device, criterion, optimizer=None, grad_clip=1.0, amp=False, scaler=None):
@@ -271,6 +287,7 @@ def main():
     model = PureMambaMulticlassModel(
         f_dyn=Xd_tr.shape[2],
         f_static=Xs_tr.shape[1],
+        seq_len=Xd_tr.shape[1],
         d_model=args.d_model,
         layers=args.layers,
     ).to(device)

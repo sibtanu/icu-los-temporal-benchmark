@@ -142,7 +142,7 @@ declare -a EXTRA_ARGS=(
   ""
   ""
   ""
-  "--lr 3e-4 --grad_clip 0.5 --layers 2"
+  ""
   ""
 )
 

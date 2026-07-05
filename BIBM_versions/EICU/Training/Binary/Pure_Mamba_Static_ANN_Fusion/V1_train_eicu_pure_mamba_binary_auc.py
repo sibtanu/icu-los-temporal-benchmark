@@ -113,27 +113,46 @@ def make_loaders(
     )
 
 
-class MambaBlock(nn.Module):
-    def __init__(
-        self,
-        d_model: int,
-        d_state: int = 16,
-        d_conv: int = 4,
-        expand: int = 2,
-        dropout: float = 0.15,
-    ):
+class RMSNorm(nn.Module):
+    def __init__(self, d):
         super().__init__()
-        self.norm = nn.LayerNorm(d_model)
-        self.mamba = Mamba(
-            d_model=d_model,
-            d_state=d_state,
-            d_conv=d_conv,
-            expand=expand,
-        )
-        self.dropout = nn.Dropout(dropout)
+        self.w = nn.Parameter(torch.ones(d))
 
     def forward(self, x):
-        return x + self.dropout(self.mamba(self.norm(x)))
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-6) * self.w
+
+
+class BiMambaEncoder(nn.Module):
+    """Bidirectional Mamba: projects input, adds positional embedding, runs N
+    residual Mamba blocks in forward and reversed directions, pools
+    [fwd_last, bwd_last, fwd_mean, bwd_mean] → 4 × d_model.
+    Canonical architecture shared across MIMIC-III and eICU Pure-Mamba scripts."""
+    def __init__(self, f_dyn, d_model=192, seq_len=24, layers=3,
+                 d_state=16, d_conv=4, expand=2, resid_scale=0.5):
+        super().__init__()
+        self.proj = nn.Linear(f_dyn, d_model)
+        self.pos_embed = nn.Embedding(seq_len, d_model)
+        self.blocks = nn.ModuleList([
+            Mamba(d_model=d_model, d_state=d_state, d_conv=d_conv, expand=expand)
+            for _ in range(layers)
+        ])
+        self.norm = RMSNorm(d_model)
+        self.resid_scale = float(resid_scale)
+
+    def encode(self, x):
+        h = self.proj(x)
+        T = h.size(1)
+        pos_ids = torch.arange(T, device=h.device).unsqueeze(0)
+        h = h + self.pos_embed(pos_ids)
+        for block in self.blocks:
+            h = h + self.resid_scale * block(h)
+            h = self.norm(h)
+        return h
+
+    def forward(self, x):
+        f = self.encode(x)
+        b = self.encode(torch.flip(x, dims=[1]))
+        return torch.cat([f[:, -1], b[:, -1], f.mean(dim=1), b.mean(dim=1)], dim=1)
 
 
 class PureMambaBinaryFusion(nn.Module):
@@ -147,99 +166,44 @@ class PureMambaBinaryFusion(nn.Module):
         d_state: int = 16,
         d_conv: int = 4,
         expand: int = 2,
-        dropout: float = 0.15,
         static_hidden: int = 128,
+        **kwargs,  # absorb legacy dropout kwarg from old call sites
     ):
         super().__init__()
-
-        self.seq_len = seq_len
-        self.d_model = d_model
-
         self.dyn_norm = nn.LayerNorm(dyn_dim)
         self.static_norm = nn.LayerNorm(static_dim)
-
-        self.dyn_proj = nn.Sequential(
-            nn.Linear(dyn_dim, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.LayerNorm(d_model),
+        self.dyn = BiMambaEncoder(
+            f_dyn=dyn_dim, d_model=d_model, seq_len=seq_len, layers=layers,
+            d_state=d_state, d_conv=d_conv, expand=expand, resid_scale=0.5,
         )
-
-        self.pos_embed = nn.Embedding(seq_len, d_model)
-
-        self.blocks = nn.ModuleList(
-            [
-                MambaBlock(
-                    d_model=d_model,
-                    d_state=d_state,
-                    d_conv=d_conv,
-                    expand=expand,
-                    dropout=dropout,
-                )
-                for _ in range(layers)
-            ]
-        )
-
-        self.final_dyn_ln = nn.LayerNorm(d_model)
-        dyn_repr_dim = d_model * 2
-
         self.static_mlp = nn.Sequential(
             nn.Linear(static_dim, static_hidden),
             nn.GELU(),
             nn.LayerNorm(static_hidden),
-            nn.Dropout(dropout),
+            nn.Dropout(0.2),
             nn.Linear(static_hidden, static_hidden),
             nn.GELU(),
             nn.LayerNorm(static_hidden),
         )
-
-        fusion_dim = dyn_repr_dim + static_hidden
-
+        fusion_dim = 4 * d_model + static_hidden
         self.fusion_ln = nn.LayerNorm(fusion_dim)
         self.fusion_gate = nn.Linear(fusion_dim, fusion_dim)
-
         self.head = nn.Sequential(
             nn.Linear(fusion_dim, 256),
             nn.GELU(),
             nn.LayerNorm(256),
-            nn.Dropout(dropout),
+            nn.Dropout(0.2),
             nn.Linear(256, 128),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.2),
             nn.Linear(128, 2),
         )
 
     def forward(self, x_dyn, x_static):
-        B, T, _ = x_dyn.shape
-
-        if T != self.seq_len:
-            raise ValueError(f"Expected seq_len={self.seq_len}, got T={T}")
-
-        x_dyn = self.dyn_norm(x_dyn)
-        x_static = self.static_norm(x_static)
-
-        x = self.dyn_proj(x_dyn)
-
-        pos_ids = torch.arange(T, device=x.device).unsqueeze(0)
-        x = x + self.pos_embed(pos_ids)
-
-        for block in self.blocks:
-            x = block(x)
-
-        x = self.final_dyn_ln(x)
-
-        h_last = x[:, -1, :]
-        h_mean = x.mean(dim=1)
-        h_dyn = torch.cat([h_last, h_mean], dim=1)
-
-        h_static = self.static_mlp(x_static)
-
+        h_dyn = self.dyn(self.dyn_norm(x_dyn))
+        h_static = self.static_mlp(self.static_norm(x_static))
         fused = torch.cat([h_dyn, h_static], dim=1)
         fused = self.fusion_ln(fused)
-
         gate = torch.sigmoid(self.fusion_gate(fused))
         return self.head(fused * gate)
 
