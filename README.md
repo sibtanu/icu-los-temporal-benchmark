@@ -1,3 +1,12 @@
+# Benchmarking Deep Temporal Architectures for ICU Length of Stay Prediction on MIMIC-III and eICU
+
+**Authors:**
+
+- **Sibtanu Raha** — Department of Computer Science, Virginia Commonwealth University, Richmond, VA, USA (rahas2@vcu.edu)
+- **Shakib Dipto** — Department of Computer Science, Old Dominion University, Norfolk, VA, USA (sdipt001@odu.edu)
+- **Pratip Rana** — Department of Computer Science, Old Dominion University, Norfolk, VA, USA (prana@odu.edu)
+- **Preetam Ghosh** — Department of Computer Science, Virginia Commonwealth University, Richmond, VA, USA (pghosh@vcu.edu)
+
 # Benchmarking Fusion Architectures for ICU Length-of-Stay Prediction
 
 Time-series deep-learning benchmark for **ICU Length-of-Stay (LOS) prediction** on
